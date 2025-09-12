@@ -1,4 +1,4 @@
-** delta-backup **
+## delta-backup
 
 **delta-backup** is a small, opinionated backup orchestrator for Linux. Unlike conventional backup systems, instead of taking huge amounts of storage, it behaves more like a versioning system, where even **binary deltas** for huge and small binary files, which makes it very easy to maintain and recover file versions across time. 
 It backs up your **host filesystem**, optional **extra paths**, and **libvirt/KVM VM disks**.
