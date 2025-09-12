@@ -32,7 +32,7 @@ Author: **Max Haase – maxhaase@gmail.com**
 Clone the repo and run the installer as root:
 
 ```bash
-git clone https://github.com/YOURNAME/delta-backup.git
+git clone https://github.com/maxhaase/delta-backup.git
 cd delta-backup
 sudo ./delta_backup_install.sh
 The installer takes delta-backup.conf from the repo and installs it to /etc/delta-backup.conf.
@@ -199,8 +199,6 @@ Switch to root:
 sudo -i
 Edit crontab (not needed if using systemd):
 
-bash
-Copy code
 crontab -e
 Check logs:
 
