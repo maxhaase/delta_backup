@@ -14,7 +14,7 @@ import sys
 import configparser
 
 # ===== CONFIG LOADING (ONLY from /etc/delta-backup.conf) =====
-# You may change the path via DELTA_CONFIG, but NO other env keys are read.
+# You may change the path via DELTA_CONFIG for testing, but NO other env keys are read.
 CONF_PATH = os.environ.get("DELTA_CONFIG", "/etc/delta-backup.conf")
 cfg = configparser.ConfigParser()
 if not os.path.isfile(CONF_PATH):
@@ -92,7 +92,7 @@ HOST_REPO          = req("host_repo")                   # Path to host repositor
 VM_REPO            = req("vm_repo")                     # Path to VM repository
 HOST_PASSFILE      = req("host_passfile")               # Passfile for host repo (read with `cat`)
 VM_PASSFILE        = req("vm_passfile")                 # Passfile for VM repo (read with `cat`)
-HOST_EXCLUDES      = opt_list("host_excludes")          # List of excludes for host backup (must be set in conf)
+HOST_EXCLUDES      = opt_list("host_excludes")          # List of excludes for host backup
 EXTRA_PATHS        = opt_list("extra_paths", "")        # List of additional paths archived separately (can be empty)
 EXTRA_PREFIX       = req("extra_prefix")                # Prefix used for extra paths (with hostname + index)
 ENABLE_PRUNE       = opt_bool("enable_prune")           # Whether to prune after backups
