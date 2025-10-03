@@ -4,407 +4,440 @@
 # Project: delta-backup orchestrator
 # Author: Max Haase – maxhaase@gmail.com
 # ===============================================
+"""
+delta_backup.py — Config-driven host + VM backups with live libvirt snapshots.
 
+Reads settings from /etc/delta_backup.conf [delta].
+- Host backup via Borg with excludes from config
+- VM backups: external snapshots (disk-only, atomic), backup base images while guest runs on overlays,
+  then blockcommit/pivot to merge overlays (no shutdowns).
+- If QEMU guest agent is available: use --quiesce (application-consistent).
+- If not: briefly virsh suspend/resume around snapshot (crash-consistent, tiny pause).
+
+Dependencies: borg, virsh (libvirt), qemu-img, mountpoint, findmnt
+"""
+
+import configparser
+import json
 import os
 import shlex
-import subprocess
-import time
+import shutil
 import socket
+import subprocess
 import sys
-import configparser
+import time
 
-# ===== CONFIG LOADING (ONLY from /etc/delta-backup.conf) =====
-# You may change the path via DELTA_CONFIG for testing, but NO other env keys are read.
-CONF_PATH = os.environ.get("DELTA_CONFIG", "/etc/delta-backup.conf")
-cfg = configparser.ConfigParser()
-if not os.path.isfile(CONF_PATH):
-    print(f"[ERROR] Config file not found: {CONF_PATH}", file=sys.stderr)
-    sys.exit(2)
-cfg.read(CONF_PATH)
-
-# Returns a required string from the [delta] section, or exits with an error.
-def req(opt: str) -> str:
-    """Fetch a REQUIRED value from [delta]; exit with error if missing or empty."""
-    if not cfg.has_option("delta", opt):
-        print(f"[ERROR] Missing required config option: {opt}", file=sys.stderr)
-        sys.exit(2)
-    val = cfg.get("delta", opt).strip()
-    if val == "":
-        print(f"[ERROR] Config option is empty: {opt}", file=sys.stderr)
-        sys.exit(2)
-    return val
-
-# Returns an optional string; if missing, returns default (which may be None).
-def opt_str(opt: str, default=None) -> str:
-    """Fetch an OPTIONAL string from [delta], returning default if not set."""
-    return cfg.get("delta", opt, fallback=default)
-
-# Parse a boolean from config, failing if malformed when required.
-def opt_bool(opt: str, default=None) -> bool:
-    """Fetch a boolean-like option; accepts: true/false/yes/no/on/off/1/0."""
-    s = cfg.get("delta", opt, fallback=None)
-    if s is None:
-        if default is None:
-            print(f"[ERROR] Missing required boolean option: {opt}", file=sys.stderr)
-            sys.exit(2)
-        return default
-    v = s.strip().lower()
-    if v in ("1", "true", "yes", "on"):  return True
-    if v in ("0", "false", "no", "off"): return False
-    print(f"[ERROR] Invalid boolean value for {opt}: {s}", file=sys.stderr)
-    sys.exit(2)
-
-# Parse an integer from config, failing if missing/invalid when required.
-def opt_int(opt: str, default=None) -> int:
-    """Fetch an integer option."""
-    s = cfg.get("delta", opt, fallback=None)
-    if s is None:
-        if default is None:
-            print(f"[ERROR] Missing required integer option: {opt}", file=sys.stderr)
-            sys.exit(2)
-        return int(default)
-    try:
-        return int(s.strip())
-    except ValueError:
-        print(f"[ERROR] Invalid integer for {opt}: {s}", file=sys.stderr)
-        sys.exit(2)
-
-# Parse comma/newline separated list; comments (#...) and blanks are ignored.
-def opt_list(opt: str, default=None) -> list:
-    """Fetch a list (comma/newline separated); returns [] if empty and no default."""
-    s = cfg.get("delta", opt, fallback=None)
-    if s is None:
-        if default is None:
-            print(f"[ERROR] Missing required list option: {opt}", file=sys.stderr)
-            sys.exit(2)
-        s = default
-    items = []
-    for line in s.replace(",", "\n").splitlines():
-        t = line.strip()
-        if not t or t.startswith("#"):
-            continue
-        items.append(t)
-    return items
-
-# ===== CORE CONFIG (ALL required unless explicitly marked optional) =====
-BACKUP_ROOT        = req("backup_root")                 # Root directory holding repositories
-HOST_REPO          = req("host_repo")                   # Path to host repository
-VM_REPO            = req("vm_repo")                     # Path to VM repository
-HOST_PASSFILE      = req("host_passfile")               # Passfile for host repo (read with `cat`)
-VM_PASSFILE        = req("vm_passfile")                 # Passfile for VM repo (read with `cat`)
-HOST_EXCLUDES      = opt_list("host_excludes")          # List of excludes for host backup
-EXTRA_PATHS        = opt_list("extra_paths", "")        # List of additional paths archived separately (can be empty)
-EXTRA_PREFIX       = req("extra_prefix")                # Prefix used for extra paths (with hostname + index)
-ENABLE_PRUNE       = opt_bool("enable_prune")           # Whether to prune after backups
-PRUNE_KEEP_DAILY   = opt_int("prune_keep_daily")        # Retention: daily
-PRUNE_KEEP_WEEKLY  = opt_int("prune_keep_weekly")       # Retention: weekly
-PRUNE_KEEP_MONTHLY = opt_int("prune_keep_monthly")      # Retention: monthly
-ENABLE_COMPACT     = opt_bool("enable_compact")         # Whether to compact repos after run
-VM_SHUTDOWN_TIMEOUT= opt_int("vm_shutdown_timeout")     # Seconds to wait for graceful VM shutdown
-VM_STARTUP_GRACE   = opt_int("vm_startup_grace")        # Seconds to wait after VM start
-LOCK_FILE          = req("lock_file")                   # Lock-file path to serialize runs
-LOCK_WAIT          = req("lock_wait")                   # Seconds to wait for repo lock
-REQUIRE_MOUNTPOINT = opt_bool("require_mountpoint")     # Enforce mountpoint for BACKUP_ROOT
-ENGINE_BIN         = req("engine_bin")                  # Underlying engine binary (e.g., borg)
-ENGINE_COMPRESSION = req("engine_compression")          # Compression string (engine-native)
-ENGINE_FILTER      = req("engine_filter")               # Filter (e.g., AME)
-ENGINE_ONE_FS      = opt_bool("engine_one_file_system") # Restrict to one filesystem
-ENGINE_FILES_CACHE = req("engine_files_cache")          # Files cache mode for engine
-
-# -----------------------------------------------
-# Utility helpers (no config duplication)
-# -----------------------------------------------
-
-# Print an error and exit with a code.
+# ---------------------- tiny util ----------------------
 def die(msg, rc=1):
-    """Print an error and exit with the given return code."""
-    print(f"[ERROR] {msg}", file=sys.stderr)
-    sys.exit(rc)
+    print(f"[ERROR] {msg}", file=sys.stderr); sys.exit(rc)
 
-# Run a shell command with logging and optional environment overrides.
+def info(msg):  print(f"[INFO]  {msg}")
+def warn(msg):  print(f"[WARN]  {msg}", file=sys.stderr)
+
 def run(cmd, check=True, capture_output=False, env=None):
-    """Run a command, echo it, and return CompletedProcess."""
     if isinstance(cmd, str):
         cmd = shlex.split(cmd)
     print(f"[CMD] {' '.join(shlex.quote(c) for c in cmd)}")
     return subprocess.run(cmd, check=check, capture_output=capture_output, text=True, env=env)
 
-# Ensure the script is executed as root (required for system-wide reads).
-def check_root():
-    """Exit if not running as root."""
-    if os.geteuid() != 0:
-        die("Must be run as root.")
+def need_cmd(name):
+    if shutil.which(name) is None:
+        die(f"Missing command: {name}")
 
-# Ensure backup root exists and (optionally) is a mountpoint.
-def ensure_mount(path):
-    """Validate that backup root exists and (optionally) is a mountpoint."""
-    if not os.path.isabs(path):
-        die(f"Backup root must be an absolute path: {path}")
-    if not os.path.isdir(path):
-        die(f"Backup root not found: {path}")
-    if REQUIRE_MOUNTPOINT:
-        if subprocess.run(["mountpoint", "-q", path]).returncode != 0:
-            die(f"{path} is not a mountpoint")
+def as_bool(v, default=False):
+    if v is None:
+        return default
+    s = str(v).strip().lower()
+    return s in ("1","y","yes","true","on")
 
-# Set umask for group collaboration: group-writable, no world access.
-def umask_group_rw():
-    """Set umask to 007 (group writable, no access for others)."""
-    os.umask(0o007)
+def split_list(s):
+    """
+    Split comma/newline separated lists; strip spaces; drop empties.
+    """
+    if not s:
+        return []
+    out = []
+    for part in str(s).replace("\r","").replace("\t"," ").split(","):
+        for piece in part.split("\n"):
+            p = piece.strip()
+            if p:
+                out.append(p)
+    return out
 
-# Build environment for the engine with non-interactive passphrase handling.
-def delta_env(passfile):
-    """Return environment for engine run (passcommand, cache, lock wait)."""
+# ---------------------- config ----------------------
+def load_config(path="/etc/delta_backup.conf"):
+    if not os.path.isfile(path):
+        die(f"Config not found: {path}")
+    cfgp = configparser.ConfigParser(
+        interpolation=None,
+        inline_comment_prefixes=("#",";"),
+        strict=False
+    )
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            cfgp.read_file(f)
+    except Exception as e:
+        die(f"Failed to read {path}: {e}")
+
+    if "delta" not in cfgp:
+        die(f"Missing [delta] section in {path}")
+
+    c = cfgp["delta"]
+
+    cfg = {}
+    # Paths
+    cfg["backup_root"]    = c.get("backup_root", "/STORE/BACKUP/")
+    cfg["host_repo"]      = c.get("host_repo",   os.path.join(cfg["backup_root"], "host-backup"))
+    cfg["vm_repo"]        = c.get("vm_repo",     os.path.join(cfg["backup_root"], "vm-backup"))
+    cfg["host_passfile"]  = c.get("host_passfile", "")
+    cfg["vm_passfile"]    = c.get("vm_passfile",   "")
+
+    # Lists
+    cfg["host_excludes"]  = split_list(c.get("host_excludes", ""))
+    cfg["extra_paths"]    = split_list(c.get("extra_paths", ""))  # not used here but parsed
+
+    # Flags / retention
+    cfg["enable_prune"]   = as_bool(c.get("enable_prune", "false"))
+    cfg["prune_keep_daily"]   = int(c.get("prune_keep_daily", "7"))
+    cfg["prune_keep_weekly"]  = int(c.get("prune_keep_weekly", "4"))
+    cfg["prune_keep_monthly"] = int(c.get("prune_keep_monthly","6"))
+    cfg["enable_compact"] = as_bool(c.get("enable_compact","true"))
+
+    # VM timing / safety
+    cfg["vm_shutdown_timeout"] = int(c.get("vm_shutdown_timeout","600"))  # not used (no shutdowns)
+    cfg["vm_startup_grace"]    = int(c.get("vm_startup_grace","5"))
+
+    # Locking / mount
+    cfg["lock_file"]           = c.get("lock_file", "/var/lock/delta-backup.lock")
+    cfg["lock_wait"]           = str(int(c.get("lock_wait", "120")))
+    cfg["require_mountpoint"]  = as_bool(c.get("require_mountpoint","false"))
+
+    # Engine knobs (borg)
+    cfg["engine_bin"]          = c.get("engine_bin","borg")
+    cfg["engine_compression"]  = c.get("engine_compression","zstd,6")
+    cfg["engine_filter"]       = c.get("engine_filter","AME")
+    cfg["engine_one_file_system"] = as_bool(c.get("engine_one_file_system","true"))
+    cfg["engine_files_cache"]  = c.get("engine_files_cache","ctime,size,inode")
+
+    # Internal defaults
+    cfg["overlay_dir"]         = "/var/lib/libvirt/images"
+
+    return cfg
+
+# ---------------------- borg helpers ----------------------
+def borg_env(cfg, passfile):
     e = os.environ.copy()
-    e["BORG_PASSCOMMAND"] = f"cat {passfile}"          # engine expects this env name
-    e["BORG_FILES_CACHE"] = ENGINE_FILES_CACHE         # config-driven cache policy
-    e["BORG_LOCK_WAIT"]   = str(LOCK_WAIT)             # config-driven lock wait
+    if passfile:
+        if not os.path.isfile(passfile):
+            die(f"Passfile not readable: {passfile}")
+        e["BORG_PASSCOMMAND"] = f"cat {passfile}"
+    if cfg["engine_files_cache"]:
+        e["BORG_FILES_CACHE"] = cfg["engine_files_cache"]
+    if cfg["lock_wait"]:
+        e["BORG_LOCK_WAIT"] = cfg["lock_wait"]
     return e
 
-# Create an archive for sources with optional excludes/comment.
-def delta_create(repo, passfile, sources, excludes=None, prefix=None, comment=None):
-    """Create an archive in repo from sources, applying excludes and metadata."""
+def borg_create(cfg, repo, passfile, sources, excludes=None, prefix=None, comment=None):
     hostname = socket.gethostname()
-    ts_local = time.strftime('%Y-%m-%d_%H-%M')
-    archive  = f"{(prefix or hostname)}-{ts_local}"
+    archive = f"{(prefix or hostname)}-{time.strftime('%Y-%m-%d_%H-%M')}"
     archive_loc = f"{repo}::{archive}"
+
     cmd = [
-        ENGINE_BIN, "create",
-        "--verbose", "--stats", "--show-rc", "--list",
-        "--filter", ENGINE_FILTER,
-        "--compression", ENGINE_COMPRESSION,
+        cfg["engine_bin"], "create",
+        "--verbose","--stats","--show-rc","--list",
+        "--filter", cfg["engine_filter"],
+        "--compression", cfg["engine_compression"],
     ]
-    if ENGINE_ONE_FS:
+    if cfg["engine_one_file_system"]:
         cmd.append("--one-file-system")
     if comment:
-        cmd.extend(["--comment", comment])
-    else:
-        cmd.extend(["--comment", f"Backup ({hostname}) {time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime())}"])
+        cmd += ["--comment", comment]
     if excludes:
         for ex in excludes:
-            cmd.extend(["--exclude", ex])
+            cmd += ["--exclude", ex]
+
     cmd.append(archive_loc)
-    cmd.extend(sources)
-    print(f"[INFO] Creating delta archive: {archive_loc}")
-    return run(cmd, check=False, env=delta_env(passfile)).returncode
+    cmd += sources
+    rc = run(cmd, check=False, env=borg_env(cfg, passfile)).returncode
+    return rc
 
-# Prune archives according to retention policy for a given prefix.
-def delta_prune(repo, passfile, prefix):
-    """Prune old archives using retention policy and prefix."""
+def borg_prune(cfg, repo, passfile, prefix):
     cmd = [
-        ENGINE_BIN, "prune",
-        "--verbose", "--stats", "--show-rc",
+        cfg["engine_bin"], "prune",
+        "--verbose","--stats","--show-rc",
         "--prefix", f"{prefix}-",
-        "--keep-daily",   str(PRUNE_KEEP_DAILY),
-        "--keep-weekly",  str(PRUNE_KEEP_WEEKLY),
-        "--keep-monthly", str(PRUNE_KEEP_MONTHLY),
-        repo,
+        repo
     ]
-    print(f"[INFO] Pruning delta archives with prefix '{prefix}-' in {repo}")
-    return run(cmd, check=False, env=delta_env(passfile)).returncode
+    for k, v in (("daily", cfg["prune_keep_daily"]),
+                 ("weekly", cfg["prune_keep_weekly"]),
+                 ("monthly", cfg["prune_keep_monthly"])):
+        cmd += [f"--keep-{k}", str(v)]
+    return run(cmd, check=False, env=borg_env(cfg, passfile)).returncode
 
-# Compact a repository to reclaim free space.
-def delta_compact(repo, passfile):
-    """Compact the repository to reclaim space."""
-    print(f"[INFO] Compacting delta repo: {repo}")
-    return run([ENGINE_BIN, "compact", "--progress", repo], check=False, env=delta_env(passfile)).returncode
+def borg_compact(cfg, repo, passfile):
+    return run([cfg["engine_bin"], "compact", "--progress", repo],
+               check=False, env=borg_env(cfg, passfile)).returncode
 
-# List all libvirt domains by name.
-def list_domains():
-    """Return a list of libvirt domain names (running or not)."""
-    res = run(["virsh", "list", "--all", "--name"], check=False, capture_output=True)
-    return [ln.strip() for ln in res.stdout.splitlines() if ln.strip()]
+# ---------------------- libvirt helpers ----------------------
+ACTIVE_STATES  = {"running","idle","blocked","pmsuspended","in shutdown"}
+PAUSED_STATE   = "paused"
 
-# Get the current state string for a libvirt domain.
-def domain_state(name):
-    """Return the current state of a libvirt domain (lowercased)."""
-    res = run(["virsh", "domstate", name], check=False, capture_output=True)
-    return res.stdout.strip().lower()
+def dom_list():
+    r = run(["virsh","list","--all","--name"], check=False, capture_output=True)
+    return [ln.strip() for ln in r.stdout.splitlines() if ln.strip()]
 
-# Determine whether the domain is considered running/active.
-def domain_running(name):
-    """Return True if the domain is running/idle/paused."""
-    return domain_state(name) in ("running", "idle", "paused")
+def dom_state(name):
+    r = run(["virsh","domstate",name], check=False, capture_output=True)
+    line = r.stdout.splitlines()[0] if r.stdout else ""
+    return line.strip().lower()
 
-# Attempt graceful shutdown of a VM, then force if needed.
-def domain_shutdown(name):
-    """Request shutdown of domain; force stop after timeout if still running."""
-    run(["virsh", "shutdown", name], check=False)
-    deadline = time.time() + VM_SHUTDOWN_TIMEOUT
-    while time.time() < deadline:
-        time.sleep(3)
-        if not domain_running(name):
+def is_running(name):  return dom_state(name) in ACTIVE_STATES
+def is_paused(name):   return dom_state(name) == PAUSED_STATE
+
+def suspend(name):
+    run(["virsh","suspend",name], check=False)
+    # Wait briefly for paused state
+    for _ in range(50):
+        if is_paused(name):
             return True
-    run(["virsh", "destroy", name], check=False)
-    time.sleep(2)
-    return not domain_running(name)
+        time.sleep(0.1)
+    return is_paused(name)
 
-# Start a VM and wait briefly.
-def domain_start(name):
-    """Start domain and wait a short grace period."""
-    run(["virsh", "start", name], check=False)
-    time.sleep(VM_STARTUP_GRACE)
+def resume(name, grace_sec):
+    run(["virsh","resume",name], check=False)
+    time.sleep(grace_sec)
 
-# Find disk image paths attached to a VM.
-def domain_disk_paths(name):
-    """Return a list of disk image file paths for a libvirt domain."""
-    res = run(["virsh", "domblklist", "--details", name], check=False, capture_output=True)
-    paths = []
-    for ln in res.stdout.splitlines():
+def qga_available(name, timeout=2):
+    try:
+        r = run(["virsh","qemu-agent-command", name, '{"execute":"guest-ping"}', f"--timeout={timeout}"],
+                check=False, capture_output=True)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+def domblk_targets(name):
+    """
+    Return list of (target, source_path) for disks.
+    """
+    r = run(["virsh","domblklist","--details",name], check=False, capture_output=True)
+    pairs = []
+    for ln in r.stdout.splitlines():
         parts = ln.split()
-        if len(parts) >= 4 and parts[0] == "file" and parts[1] == "disk":
-            src = parts[-1]
-            if os.path.isabs(src) and os.path.exists(src):
-                paths.append(src)
-    if not paths:
-        img_dir = "/var/lib/libvirt/images"
-        if os.path.isdir(img_dir):
-            for fn in os.listdir(img_dir):
-                if name in fn:
-                    paths.append(os.path.join(img_dir, fn))
-    return paths
+        if len(parts) >= 5 and parts[1] == "disk":
+            pairs.append((parts[2], parts[-1]))
+    return pairs
 
-# Acquire a simple lock using a lockfile.
-def acquire_lock():
-    """Create a lock file to ensure only one run at a time."""
-    fd = os.open(LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-    os.write(fd, str(os.getpid()).encode())
-    os.close(fd)
-
-# Release the lockfile if present.
-def release_lock():
-    """Remove the lock file (ignore if missing)."""
+def qemu_img_info_json(path):
+    r = run(["qemu-img","info","--output=json", path], check=False, capture_output=True)
+    if r.returncode != 0:
+        return None
     try:
-        os.unlink(LOCK_FILE)
-    except FileNotFoundError:
-        pass
+        return json.loads(r.stdout)
+    except Exception:
+        return None
 
-# Validate that repos exist and passfiles are configured.
-def require_repos_and_passfiles():
-    """Verify repositories exist and passfiles are configured; exit if missing."""
-    for path, label in ((HOST_REPO, "host_repo"), (VM_REPO, "vm_repo")):
-        if not os.path.isdir(path):
-            die(f"Repository not found: {path}")
-    for pth, label in ((HOST_PASSFILE, "host_passfile"), (VM_PASSFILE, "vm_passfile")):
-        if not os.path.isfile(pth):
-            die(f"Passfile not found: {pth}")
+def create_external_snapshot(name, use_quiesce):
+    snap_name = f"delta-{name}-{time.strftime('%Y%m%d-%H%M%S')}"
+    args = ["virsh","snapshot-create-as","--domain",name,"--name",snap_name,"--disk-only","--atomic"]
+    if use_quiesce:
+        args.append("--quiesce")
+    r = run(args, check=False)
+    if r.returncode != 0:
+        die(f"Snapshot create failed for {name} (quiesce={use_quiesce})")
+    return snap_name
 
-# Orchestrate host + extra paths + VM backups with optional prune/compact.
-def main():
-    # Ensure we are root for system-wide access
-    check_root()  # verify root privileges
-    # Set cooperative permissions for group workflows
-    umask_group_rw()  # set umask 007 (group-writable, no world)
-    # Validate backup root and (optionally) mountpoint
-    ensure_mount(BACKUP_ROOT)  # ensure root exists and is mounted if required
-    # Validate repos and passfiles before proceeding
-    require_repos_and_passfiles()  # exit early if repos or passfiles are missing
+def bases_from_overlays(after_pairs):
+    """
+    From domain block map AFTER snapshot, extract base images via qemu-img backing-filename.
+    """
+    bases = []
+    overlays = []
+    for tgt, overlay in after_pairs:
+        if not os.path.isabs(overlay):
+            continue
+        info = qemu_img_info_json(overlay)
+        if info:
+            backing = info.get("backing-filename")
+            if backing:
+                if not os.path.isabs(backing):
+                    backing = os.path.abspath(os.path.join(os.path.dirname(overlay), backing))
+                if os.path.exists(backing):
+                    bases.append(backing)
+        overlays.append(overlay)
+    # De-duplicate while keeping order
+    seen = set(); bases = [x for x in bases if not (x in seen or seen.add(x))]
+    seen = set(); overlays = [x for x in overlays if not (x in seen or seen.add(x))]
+    return bases, overlays
 
-    # Acquire an exclusive run lock
+def blockcommit_pivot(name, targets):
+    for tgt in targets:
+        run(["virsh","blockcommit",name,tgt,"--active","--verbose","--pivot"], check=False)
+
+# ---------------------- lock + mount ----------------------
+def acquire_lock(path):
     try:
-        acquire_lock()  # create lockfile atomically
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        os.write(fd, str(os.getpid()).encode()); os.close(fd)
+        return True
     except FileExistsError:
-        die(f"Another run is active (lock: {LOCK_FILE})")  # refuse concurrent run
+        return False
 
+def release_lock(path):
+    try: os.unlink(path)
+    except FileNotFoundError: pass
+
+def ensure_mountpoint(cfg):
+    if cfg["require_mountpoint"]:
+        need_cmd("findmnt")
+        r = run(["findmnt","-rno","TARGET", cfg["backup_root"]], check=False, capture_output=True)
+        if r.returncode != 0:
+            die(f"require_mountpoint=true but {cfg['backup_root']} is not a mountpoint.")
+    # Always ensure /STORE is mounted if you rely on it (optional hardening)
+    if os.path.isdir("/STORE"):
+        if run(["mountpoint","-q","/STORE"], check=False).returncode != 0:
+            die("/STORE is not mounted (safety check).")
+
+# ---------------------- main backup flow ----------------------
+def backup_host(cfg):
+    host = socket.gethostname()
+    info("=== HOST BACKUP ===")
+    rc_host = borg_create(
+        cfg, cfg["host_repo"], cfg["host_passfile"],
+        sources=["/"],
+        excludes=cfg["host_excludes"],
+        prefix=host,
+        comment=f"Host filesystem backup ({host})"
+    )
+    if rc_host not in (0,1):
+        warn(f"borg create for host returned {rc_host}")
+    # Example: extra paths could be separate archives (not used unless wanted)
+    # if cfg["extra_paths"]:
+    #     for idx, p in enumerate(cfg["extra_paths"], 1):
+    #         borg_create(cfg, cfg["host_repo"], cfg["host_passfile"],
+    #                     sources=[p], excludes=None,
+    #                     prefix=f"{host}-extra{idx}",
+    #                     comment=f"Extra path backup ({p}) on {host}")
+
+    if cfg["enable_prune"]:
+        borg_prune(cfg, cfg["host_repo"], cfg["host_passfile"], prefix=host)
+    else:
+        info("Retention (prune) disabled for host repo.")
+    if cfg["enable_compact"]:
+        borg_compact(cfg, cfg["host_repo"], cfg["host_passfile"])
+
+def backup_vms_live(cfg):
+    host = socket.gethostname()
+    info("=== VM BACKUPS (live external snapshots) ===")
+    vms = dom_list()
+    if not vms:
+        info("No libvirt domains found.")
+        return
+    os.makedirs(cfg["overlay_dir"], exist_ok=True)
+
+    for name in vms:
+        print()
+        info(f"--- VM: {name} ---")
+        paused_here = False
+        try:
+            has_qga = qga_available(name)
+            info(f"QEMU guest agent: {'available' if has_qga else 'not available'}")
+
+            # If no agent, pause briefly to capture consistent snapshot window
+            if not has_qga:
+                info(f"Pausing {name} briefly for snapshot …")
+                if suspend(name):
+                    paused_here = True
+                else:
+                    warn(f"Could not confirm paused state for {name}; continuing.")
+
+            before = domblk_targets(name)
+            snap_name = create_external_snapshot(name, use_quiesce=has_qga)
+            info(f"Created snapshot: {snap_name}")
+
+            # Resume immediately if we paused
+            if paused_here:
+                resume(name, cfg["vm_startup_grace"])
+                paused_here = False
+
+            after = domblk_targets(name)
+            bases, overlays = bases_from_overlays(after)
+            if not bases:
+                warn("Could not determine base images from overlays; falling back to current sources.")
+                bases = [src for (_, src) in after if os.path.isabs(src) and os.path.exists(src)]
+
+            info("Base images: " + (", ".join(bases) if bases else "(none)"))
+            info("Overlay images: " + (", ".join(overlays) if overlays else "(none)"))
+
+            # Backup bases while VM runs on overlays
+            rc_vm = borg_create(
+                cfg, cfg["vm_repo"], cfg["vm_passfile"],
+                sources=bases,
+                excludes=None,
+                prefix=f"{host}-{name}",
+                comment=f"VM disk backup (external snapshot base) for {name} on {host}"
+            )
+            if rc_vm not in (0,1):
+                warn(f"borg create for VM {name} returned {rc_vm}")
+
+            # Merge overlays back and pivot
+            targets = [t for (t, _) in after]
+            info("Blockcommit/pivot overlays: " + (", ".join(targets) if targets else "(none)"))
+            if targets:
+                blockcommit_pivot(name, targets)
+
+            # Cleanup leftover overlay files (libvirt usually unlinks on pivot; best-effort)
+            for ov in overlays:
+                try:
+                    if os.path.exists(ov):
+                        os.unlink(ov)
+                except Exception as e:
+                    warn(f"Could not delete overlay {ov}: {e}")
+
+        finally:
+            if paused_here:
+                try:
+                    resume(name, cfg["vm_startup_grace"])
+                except Exception:
+                    pass
+
+    if cfg["enable_prune"]:
+        borg_prune(cfg, cfg["vm_repo"], cfg["vm_passfile"], prefix=f"{host}-")
+    else:
+        info("Retention (prune) disabled for VM repo.")
+    if cfg["enable_compact"]:
+        borg_compact(cfg, cfg["vm_repo"], cfg["vm_passfile"])
+
+# ---------------------- entry ----------------------
+def main():
+    if os.geteuid() != 0:
+        die("Must be run as root.")
+    for tool in ("borg","virsh","qemu-img","mountpoint"):
+        need_cmd(tool)
+
+    conf_path = os.environ.get("DELTA_CONF", "/etc/delta_backup.conf")
+    cfg = load_config(conf_path)
+
+    # Sanity
+    for p in (cfg["host_repo"], cfg["vm_repo"]):
+        if not os.path.isdir(p):
+            die(f"Repository not found: {p}")
+
+    if not acquire_lock(cfg["lock_file"]):
+        die(f"Another run is active (lock: {cfg['lock_file']})")
     try:
-        # Cache hostname for archive naming
-        host = socket.gethostname()  # get system hostname
+        ensure_mountpoint(cfg)
 
-        # === HOST BACKUP ===
-        print("\n=== HOST DELTA BACKUP ===")  # section header for host backups
-        rc_host = delta_create(  # create archive of root filesystem
-            repo=HOST_REPO,                      # repository for host backups
-            passfile=HOST_PASSFILE,              # passfile for host repository
-            sources=["/"],                       # root filesystem
-            excludes=HOST_EXCLUDES,              # exclusions (from conf)
-            prefix=host,                         # archive prefix equals hostname
-            comment=f"Host filesystem backup ({host})",  # descriptive comment
-        )
-        if rc_host not in (0, 1):  # 0 OK, 1 warnings
-            print(f"[WARN] delta create for host returned {rc_host}")  # warn if unusual return code
+        # HOST BACKUP
+        backup_host(cfg)
 
-        # === EXTRA PATHS (optional, separate archives per path) ===
-        if EXTRA_PATHS:  # if any extra paths defined
-            print("\n=== EXTRA PATHS BACKUP ===")  # section header for extra path backups
-            for idx, path in enumerate(EXTRA_PATHS, 1):  # iterate with index
-                if not os.path.exists(path):  # skip missing paths
-                    print(f"[WARN] Extra path missing: {path}")  # warn on missing path
-                    continue  # next path
-                pref = f"{host}-{EXTRA_PREFIX}-{idx}"  # construct archive prefix for this path
-                rc_extra = delta_create(  # create archive for the extra path
-                    repo=HOST_REPO,                 # use host repository
-                    passfile=HOST_PASSFILE,         # use host passfile
-                    sources=[path],                 # single extra path
-                    excludes=None,                  # no excludes for targeted path
-                    prefix=pref,                    # path-specific prefix
-                    comment=f"Extra path backup '{path}' ({host})",  # descriptive comment
-                )
-                if rc_extra not in (0, 1):  # verify status code
-                    print(f"[WARN] delta create for extra path {path} returned {rc_extra}")  # warn if needed
-        else:
-            print("\n[INFO] No extra paths configured (extra_paths empty).")  # informative message
+        # VM BACKUPS (live snapshots)
+        backup_vms_live(cfg)
 
-        # === RETENTION (optional) ===
-        if ENABLE_PRUNE:  # retention enabled in config
-            delta_prune(HOST_REPO, HOST_PASSFILE, prefix=host)  # prune host filesystem archives
-            if EXTRA_PATHS:  # if there were extra path archives
-                delta_prune(HOST_REPO, HOST_PASSFILE, prefix=f"{host}-{EXTRA_PREFIX}-")  # prune extra archives
-        else:
-            print("[INFO] Retention (prune) disabled for host repo.")  # note disabled
-
-        # === SPACE RECLAMATION (optional) ===
-        if ENABLE_COMPACT:  # compaction enabled in config
-            delta_compact(HOST_REPO, HOST_PASSFILE)  # compact host repository
-
-        # === VM BACKUPS ===
-        print("\n=== VM DELTA BACKUPS ===")  # section header for VM backups
-        domains = list_domains()  # list all libvirt domains
-        if not domains:  # if there are no domains
-            print("[INFO] No libvirt domains found.")  # info message
-        for name in domains:  # iterate over domains
-            print(f"\n--- VM: {name} ---")  # VM header
-            was_running = domain_running(name)  # check if currently running
-            if was_running:  # if active
-                print(f"[INFO] Shutting down {name} ...")  # notify shutdown
-                if not domain_shutdown(name):  # graceful shutdown or force
-                    print(f"[WARN] {name} did not shut down cleanly; proceeding after force.")  # warn unclean stop
-            else:
-                print(f"[INFO] {name} is not running.")  # note VM was already stopped
-
-            disks = domain_disk_paths(name)  # find disk image paths
-            if not disks:  # none found
-                print(f"[WARN] No disk paths found for {name}; skipping backup.")  # warn and skip
-            else:
-                print(f"[INFO] Disks for {name}: {', '.join(disks)}")  # list disks to be backed up
-                rc_vm = delta_create(  # create archive for VM disks
-                    repo=VM_REPO,                 # VM repository
-                    passfile=VM_PASSFILE,         # VM passfile
-                    sources=disks,                # disk files for this VM
-                    prefix=f"{host}-{name}",      # archive prefix (host + vm)
-                    comment=f"VM disk backup ({name} on {host})",  # descriptive comment
-                )
-                if rc_vm not in (0, 1):  # check result
-                    print(f"[WARN] delta create for VM {name} returned {rc_vm}")  # warn if issues
-
-            if was_running:  # if we had stopped it
-                print(f"[INFO] Starting {name} ...")  # notify restart
-                domain_start(name)  # start VM and wait briefly
-
-        # === VM RETENTION (optional) ===
-        if ENABLE_PRUNE:  # retention enabled
-            delta_prune(VM_REPO, VM_PASSFILE, prefix=f"{host}-")  # prune VM archives
-        else:
-            print("[INFO] Retention (prune) disabled for VM repo.")  # note disabled
-
-        # === VM SPACE RECLAMATION (optional) ===
-        if ENABLE_COMPACT:  # compaction toggle
-            delta_compact(VM_REPO, VM_PASSFILE)  # compact VM repository
-
-        # === FINISH ===
-        print("\n=== DONE ===")  # completion notice
+        info("=== DONE ===")
     finally:
-        # Always release the lock
-        release_lock()  # remove lock file
+        release_lock(cfg["lock_file"])
 
-# Entrypoint
+# ----------------------
 if __name__ == "__main__":
     main()
+
