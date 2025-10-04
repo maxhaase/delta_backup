@@ -144,10 +144,10 @@ info "VM repository: $REPO"
 choose_archive() {
   local repo="$1"
   local -a ARCHIVES=()
-  LC_ALL=C readarray -t ARCHIVES < <(borg list "$repo" --format '{archive}{NL}' | sort -r | head -n 20)
+  LC_ALL=C readarray -t ARCHIVES < <(borg list "$repo" --format '{archive}{NL}' | sort -r | head -n 50)
   ((${#ARCHIVES[@]})) || die "No archives found in $repo"
 
-  echo "=== Available VM backups (latest 20) ===" >/dev/tty
+  echo "=== Available VM backups (latest 50) ===" >/dev/tty
   for i in "${!ARCHIVES[@]}"; do
     printf "%2d) %s\n" $((i+1)) "${ARCHIVES[i]}" >/dev/tty
   done
