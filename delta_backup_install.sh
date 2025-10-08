@@ -1,128 +1,508 @@
 #!/usr/bin/env bash
 # ===============================================
-# Project: delta-backup installer
+# Project: delta-backup interactive installer
 # Author: Max Haase – maxhaase@gmail.com
 # ===============================================
 
 set -euo pipefail
 
-# ---- Paths ----
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-CONF_SRC="${SCRIPT_DIR}/delta-backup.conf"         # conf shipped in the repo
-CONF_DST="/etc/delta-backup.conf"                  # canonical system conf
+# ---- Colors for output ---
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
 
-# ---- Behavior flags ----
-# Set DELTA_FORCE=1 to overwrite an existing /etc/delta-backup.conf (keeps a .bak)
-DELTA_FORCE="${DELTA_FORCE:-0}"
+info() { echo -e "${GREEN}[INFO]${NC} $1"; }
+warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
+error() { echo -e "${RED}[ERROR]${NC} $1" >&2; }
+question() { echo -e "${BLUE}[QUESTION]${NC} $1"; }
 
-# --- Minimal INI reader for [delta] keys from a given file ---
-ini_get() {
-  # Usage: ini_get FILE KEY
-  local file="$1" key="$2"
-  awk -v k="$key" '
-    BEGIN{ IGNORECASE=1; in=0; }
-    /^\s*\[/ { in = tolower($0) ~ /^\s*\[delta\]\s*$/ }
-    in && /^[[:space:]]*([A-Za-z0-9_]+)[[:space:]]*=/ {
-      line=$0
-      sub(/[[:space:]]*#.*$/,"",line)
-      split(line, a, "=")
-      conf_key=a[1]; gsub(/^[ \t]+|[ \t]+$/, "", conf_key)
-      if (tolower(conf_key) == tolower(k)) {
-        val=a[2]; sub(/^[ \t]+/,"",val); sub(/[ \t]+$/,"",val)
-        print val
-        exit
-      }
-    }
-  ' "$file"
-}
-
-# --- Step 1: Ensure the repo conf exists ---
-if [[ ! -f "$CONF_SRC" ]]; then
-  echo "[ERROR] Missing ${CONF_SRC}. Ensure you cloned the repo with delta-backup.conf present." >&2
-  exit 2
-fi
-
-# --- Step 2: Install/Copy conf to /etc (never silently overwrite) ---
-install_conf() {
-  # Create /etc if needed
-  install -d -m 0755 "$(dirname "$CONF_DST")"
-  if [[ -f "$CONF_DST" && "$DELTA_FORCE" != "1" ]]; then
-    echo "[INFO] ${CONF_DST} already exists. Not overwriting."
-    echo "       To overwrite, re-run with: DELTA_FORCE=1 sudo ./delta_backup_install.sh"
-  else
-    if [[ -f "$CONF_DST" ]]; then
-      ts="$(date +%Y%m%d-%H%M%S)"
-      cp -f "$CONF_DST" "${CONF_DST}.bak-${ts}"
-      echo "[INFO] Existing config backed up to ${CONF_DST}.bak-${ts}"
+# --- Check if running as root ---
+check_root() {
+    if [[ $EUID -ne 0 ]]; then
+        error "This script must be run as root!"
+        echo "Please run as: sudo $0"
+        exit 1
     fi
-    install -m 0640 "$CONF_SRC" "$CONF_DST"
-    echo "[INFO] Installed ${CONF_SRC} -> ${CONF_DST}"
-  fi
 }
-install_conf
 
-# --- Step 3: Read all required values FROM THE REPO CONF (source of truth during install) ---
-DELTA_USER="$(ini_get "$CONF_SRC" delta_user)"
-DELTA_GROUP="$(ini_get "$CONF_SRC" delta_group)"
-BACKUP_ROOT="$(ini_get "$CONF_SRC" backup_root)"
-HOST_REPO="$(ini_get "$CONF_SRC" host_repo)"
-VM_REPO="$(ini_get "$CONF_SRC" vm_repo)"
-HOST_PASSFILE="$(ini_get "$CONF_SRC" host_passfile)"
-VM_PASSFILE="$(ini_get "$CONF_SRC" vm_passfile)"
-ENGINE_BIN="$(ini_get "$CONF_SRC" engine_bin)"
+# --- Detect package manager ---
+detect_package_manager() {
+    if command -v apt >/dev/null 2>&1; then
+        echo "apt"
+    elif command -v dnf >/dev/null 2>&1; then
+        echo "dnf"
+    elif command -v yum >/dev/null 2>&1; then
+        echo "yum"
+    else
+        error "Could not detect package manager (apt, dnf, or yum)"
+        exit 1
+    fi
+}
 
-# --- Step 4: Validate critical config before touching the system ---
-: "${DELTA_USER:?Missing delta_user in $CONF_SRC}"
-: "${DELTA_GROUP:?Missing delta_group in $CONF_SRC}"
-: "${BACKUP_ROOT:?Missing backup_root in $CONF_SRC}"
-: "${HOST_REPO:?Missing host_repo in $CONF_SRC}"
-: "${VM_REPO:?Missing vm_repo in $CONF_SRC}"
-: "${HOST_PASSFILE:?Missing host_passfile in $CONF_SRC}"
-: "${VM_PASSFILE:?Missing vm_passfile in $CONF_SRC}"
-: "${ENGINE_BIN:?Missing engine_bin in $CONF_SRC}"
+# --- Install packages based on detected package manager ---
+install_packages() {
+    local pm="$1"
+    info "Installing prerequisites using $pm..."
+    
+    case "$pm" in
+        apt)
+            apt update
+            apt install -y borgbackup python3 libvirt-daemon-system sudo fzf
+            ;;
+        dnf)
+            dnf check-update || true
+            dnf install -y borgbackup python3 libvirt sudo fzf
+            ;;
+        yum)
+            yum check-update || true
+            yum install -y borgbackup python3 libvirt sudo fzf
+            ;;
+    esac
+    
+    # Verify fzf installation
+    if ! command -v fzf >/dev/null 2>&1; then
+        warn "fzf not available in repositories, installing via alternative method..."
+        install_fzf_alternative
+    else
+        info "fzf installed successfully"
+    fi
+}
 
-echo "=== Install prerequisites ==="
-apt update
-apt install -y borgbackup python3-venv pipx acl qemu-kvm libvirt-daemon-system sudo
+# --- Alternative fzf installation ---
+install_fzf_alternative() {
+    # Try to install fzf from GitHub
+    local fzf_dir="/tmp/fzf-install"
+    git clone --depth 1 https://github.com/junegunn/fzf.git "$fzf_dir" 2>/dev/null || {
+        warn "Could not clone fzf repository"
+        return 1
+    }
+    "$fzf_dir/install" --bin 2>/dev/null || {
+        warn "Could not install fzf from source"
+        return 1
+    }
+    
+    # Copy binary to /usr/local/bin
+    cp "$fzf_dir/bin/fzf" "/usr/local/bin/fzf" 2>/dev/null && \
+    chmod +x "/usr/local/bin/fzf" && \
+    info "fzf installed to /usr/local/bin/fzf"
+    
+    # Cleanup
+    rm -rf "$fzf_dir"
+}
 
-echo "=== Ensure user/group exist ==="
-if ! id -u "$DELTA_USER" >/dev/null 2>&1; then
-  adduser --disabled-password --gecos "" "$DELTA_USER"
-fi
-if ! getent group "$DELTA_GROUP" >/dev/null; then
-  groupadd "$DELTA_GROUP"
-fi
-usermod -a -G "$DELTA_GROUP" "$DELTA_USER"
+# --- Get current user (the one who called sudo) ---
+get_current_user() {
+    if [[ -n "${SUDO_USER:-}" ]]; then
+        echo "$SUDO_USER"
+    else
+        whoami
+    fi
+}
 
-echo "=== Create repository directories with group access ==="
-mkdir -p "$HOST_REPO" "$VM_REPO"
-chown -R "$DELTA_USER:$DELTA_GROUP" "$BACKUP_ROOT"
-chmod -R 2770 "$BACKUP_ROOT"   # setgid so new files inherit the group
+# --- Prompt for input with default ---
+prompt_with_default() {
+    local prompt="$1"
+    local default="$2"
+    local var_name="$3"
+    
+    if [[ -n "$default" ]]; then
+        read -p "$(question "$prompt [$default]: ")" input
+        eval "$var_name=\"\${input:-\$default}\""
+    else
+        read -p "$(question "$prompt: ")" input
+        eval "$var_name=\"\$input\""
+    fi
+}
 
-echo "=== Prepare config directory skeleton (no secrets created) ==="
-install -d -m 0750 -o "$DELTA_USER" -g "$DELTA_GROUP" "/home/$DELTA_USER/.config/delta"
+# --- Prompt for password ---
+prompt_password() {
+    local prompt="$1"
+    local var_name="$2"
+    
+    while true; do
+        read -s -p "$(question "$prompt: ")" password
+        echo
+        if [[ -z "$password" ]]; then
+            warn "Password cannot be empty"
+            continue
+        fi
+        read -s -p "$(question "Confirm password: ")" password_confirm
+        echo
+        if [[ "$password" != "$password_confirm" ]]; then
+            error "Passwords do not match!"
+        else
+            eval "$var_name=\"\$password\""
+            break
+        fi
+    done
+}
 
-echo "=== Optional UI: BorgWeb ==="
-sudo -u "$DELTA_USER" pipx ensurepath || true
-sudo -u "$DELTA_USER" pipx install borgweb || true
+# --- Generate config file ---
+generate_config() {
+    local config_file="$1"
+    cat > "$config_file" << EOF
+# ===============================================
+# Project: delta-backup configuration
+# Generated by installer on $(date)
+# ===============================================
 
-echo "=== Initialize repositories (interactive once for passphrases) ==="
-sudo -u "$DELTA_USER" "$ENGINE_BIN" init --encryption=repokey-blake2 "$VM_REPO" || true
-sudo -u "$DELTA_USER" "$ENGINE_BIN" init --encryption=repokey-blake2 "$HOST_REPO" || true
+[delta]  # BEGIN delta section
 
-echo "=== Tighten passfile permissions if present ==="
-if [[ -e "$HOST_PASSFILE" ]]; then
-  chown "$DELTA_USER:$DELTA_GROUP" "$HOST_PASSFILE" || true
-  chmod 0640 "$HOST_PASSFILE" || true
-fi
-if [[ -e "$VM_PASSFILE" ]]; then
-  chown "$DELTA_USER:$DELTA_GROUP" "$VM_PASSFILE" || true
-  chmod 0640 "$VM_PASSFILE" || true
-fi
+# Basic paths
+backup_root = $BACKUP_ROOT
+host_repo   = $BACKUP_ROOT/host-backup
+vm_repo     = $BACKUP_ROOT/vm-backup
 
-echo "=== Done ==="
-echo "Config is installed at: $CONF_DST"
-echo "Run the orchestrator with:"
-echo "  sudo ./delta_backup.py"
-echo "  # or, if testing a different conf path:"
-echo "  sudo DELTA_CONFIG=\"$CONF_DST\" ./delta_backup.py"
+# Authentication
+host_passfile = /home/$DELTA_USER/.config/delta/host.pass
+vm_passfile   = /home/$DELTA_USER/.config/delta/vm.pass
+
+# Exclusions (backup device will be automatically excluded)
+host_excludes = /proc,/sys,/dev,/run,/tmp,/var/tmp,/lost+found,/mnt,/media,/SWAPFILE,/var/lib/libvirt/images,/var/cache,/var/lib/apt/lists,/var/cache/apt/archives,*/.cache,$BACKUP_ROOT
+
+# Extra paths to backup (comma separated)
+extra_paths = 
+extra_prefix = extra
+
+# Retention policy
+enable_prune = true
+prune_keep_daily = $RETAIN_DAILY
+prune_keep_weekly = $RETAIN_WEEKLY
+prune_keep_monthly = $RETAIN_MONTHLY
+prune_keep_yearly = $RETAIN_YEARLY
+
+# Repository maintenance
+enable_compact = true
+
+# VM settings
+vm_shutdown_timeout = 600
+vm_startup_grace = 5
+
+# Lock file
+lock_file = /var/lock/delta-backup.lock
+lock_wait = 120
+require_mountpoint = false
+
+# Borg engine settings
+engine_bin = borg
+engine_compression = zstd,6
+engine_filter = AME
+engine_one_file_system = true
+engine_files_cache = ctime,size,inode
+
+# User and group
+max_user = $DELTA_USER
+max_group = $DELTA_GROUP
+
+# END delta section
+EOF
+}
+
+# --- Create passphrase files ---
+create_passfiles() {
+    local user="$1"
+    local group="$2"
+    local password="$3"
+    
+    local config_dir="/home/$user/.config/delta"
+    local host_passfile="$config_dir/host.pass"
+    local vm_passfile="$config_dir/vm.pass"
+    
+    # Create config directory
+    install -d -m 0750 -o "$user" -g "$group" "$config_dir"
+    
+    # Create passfiles with the same password
+    echo "$password" > "$host_passfile"
+    echo "$password" > "$vm_passfile"
+    
+    # Secure permissions
+    chown "$user:$group" "$host_passfile" "$vm_passfile"
+    chmod 0640 "$host_passfile" "$vm_passfile"
+    
+    info "Passphrase files created in $config_dir"
+}
+
+# --- Install backup script with aliases ---
+install_backup_script() {
+    local script_src="$1"
+    local install_dir="$2"
+    
+    # Create installation directory if it doesn't exist
+    mkdir -p "$install_dir"
+    
+    # Install main backup script
+    install -m 0755 "$script_src" "$install_dir/delta-backup"
+    info "Installed backup script: $install_dir/delta-backup"
+    
+    # Create restore alias script
+    cat > "$install_dir/delta-restore" << 'EOF'
+#!/usr/bin/env bash
+echo "Delta Backup Restore Utility"
+echo "============================"
+echo "For restore operations, use Borg commands directly:"
+echo
+echo "1. List archives in a repository:"
+echo "   borg list /path/to/repo"
+echo
+echo "2. Mount a repository for browsing:"
+echo "   borg mount /path/to/repo /mnt/backup"
+echo
+echo "3. Extract specific files:"
+echo "   borg extract /path/to/repo::archive-name path/to/file"
+echo
+echo "4. For interactive restore with fzf, use:"
+echo "   borg list /path/to/repo | fzf"
+echo
+echo "Note: The main backup script is at: $(which delta-backup)"
+EOF
+    chmod 0755 "$install_dir/delta-restore"
+    info "Installed restore helper: $install_dir/delta-restore"
+    
+    # Create symbolic links if /usr/local/bin is in PATH
+    if [[ ":$PATH:" == *":/usr/local/bin:"* ]]; then
+        ln -sf "$install_dir/delta-backup" "/usr/local/bin/backup" 2>/dev/null || true
+        ln -sf "$install_dir/delta-restore" "/usr/local/bin/restore" 2>/dev/null || true
+        info "Created aliases: 'backup' and 'restore' commands are now available"
+    fi
+}
+
+# --- Add to shell profiles ---
+setup_shell_aliases() {
+    local user="$1"
+    local install_dir="$2"
+    
+    local user_home="/home/$user"
+    local profiles=(".bashrc" ".profile")
+    
+    for profile in "${profiles[@]}"; do
+        local profile_path="$user_home/$profile"
+        if [[ -f "$profile_path" ]]; then
+            # Add to PATH if not already there
+            if ! grep -q "$install_dir" "$profile_path"; then
+                echo "export PATH=\"\$PATH:$install_dir\"" >> "$profile_path"
+                info "Added $install_dir to PATH in $profile_path"
+            fi
+        fi
+    done
+}
+
+# --- Initialize Borg repositories ---
+init_repositories() {
+    local user="$1"
+    local host_repo="$2"
+    local vm_repo="$3"
+    local engine_bin="$4"
+    
+    info "Initializing Borg repositories..."
+    
+    # Initialize host repository
+    if [[ ! -d "$host_repo" ]] || [[ -z "$(ls -A "$host_repo")" ]]; then
+        sudo -u "$user" "$engine_bin" init --encryption=repokey-blake2 "$host_repo"
+        info "Initialized host repository: $host_repo"
+    else
+        info "Host repository already exists: $host_repo"
+    fi
+    
+    # Initialize VM repository
+    if [[ ! -d "$vm_repo" ]] || [[ -z "$(ls -A "$vm_repo")" ]]; then
+        sudo -u "$user" "$engine_bin" init --encryption=repokey-blake2 "$vm_repo"
+        info "Initialized VM repository: $vm_repo"
+    else
+        info "VM repository already exists: $vm_repo"
+    fi
+}
+
+# --- Main installation function ---
+main() {
+    check_root
+    
+    info "=== Delta Backup Interactive Installer ==="
+    echo
+    info "This script will install and configure Delta Backup system."
+    echo
+    
+    # Get script directory
+    SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+    BACKUP_SCRIPT_SRC="${SCRIPT_DIR}/backup.py"
+    
+    if [[ ! -f "$BACKUP_SCRIPT_SRC" ]]; then
+        error "Backup script not found: $BACKUP_SCRIPT_SRC"
+        exit 2
+    fi
+    
+    # Detect package manager
+    PACKAGE_MANAGER=$(detect_package_manager)
+    info "Detected package manager: $PACKAGE_MANAGER"
+    
+    # --- Interactive Configuration ---
+    
+    # Installation directory
+    DEFAULT_INSTALL_DIR="/usr/local/bin"
+    prompt_with_default "Installation directory for backup scripts" "$DEFAULT_INSTALL_DIR" "INSTALL_DIR"
+    
+    # Backup storage location
+    DEFAULT_BACKUP_ROOT="/opt/backup"
+    prompt_with_default "Backup storage location (where repositories will be stored)" "$DEFAULT_BACKUP_ROOT" "BACKUP_ROOT"
+    
+    # User selection
+    CURRENT_USER=$(get_current_user)
+    question "Choose the user account for backup operations:"
+    echo "  1) Use current user: $CURRENT_USER"
+    echo "  2) Create new user: delta (recommended for corporate environments)"
+    echo "  3) Create new user: borg"
+    echo "  4) Specify another username"
+    
+    while true; do
+        read -p "$(question "Select option [1-4]: ")" user_choice
+        case $user_choice in
+            1)
+                DELTA_USER="$CURRENT_USER"
+                break
+                ;;
+            2)
+                DELTA_USER="delta"
+                break
+                ;;
+            3)
+                DELTA_USER="borg"
+                break
+                ;;
+            4)
+                read -p "$(question "Enter username: ")" DELTA_USER
+                if [[ -n "$DELTA_USER" ]]; then
+                    break
+                else
+                    warn "Username cannot be empty"
+                fi
+                ;;
+            *)
+                warn "Invalid option"
+                ;;
+        esac
+    done
+    
+    # Group selection
+    DEFAULT_GROUP="backup"
+    prompt_with_default "User group for backup operations" "$DEFAULT_GROUP" "DELTA_GROUP"
+    
+    # Retention policy
+    question "Configure retention policy:"
+    prompt_with_default "Keep daily backups for how many days?" "7" "RETAIN_DAILY"
+    prompt_with_default "Keep weekly backups for how many weeks?" "4" "RETAIN_WEEKLY"
+    prompt_with_default "Keep monthly backups for how many months?" "6" "RETAIN_MONTHLY"
+    prompt_with_default "Keep yearly backups for how many years?" "1" "RETAIN_YEARLY"
+    
+    # Repository password
+    info "Set passphrase for Borg repositories (used for both host and VM repositories)"
+    info "You can change individual repository passphrases later if needed"
+    prompt_password "Enter repository passphrase" "REPO_PASSWORD"
+    
+    # --- Summary and Confirmation ---
+    echo
+    info "=== Installation Summary ==="
+    echo "Package manager: $PACKAGE_MANAGER"
+    echo "Installation directory: $INSTALL_DIR"
+    echo "Backup storage: $BACKUP_ROOT"
+    echo "Backup user: $DELTA_USER"
+    echo "Backup group: $DELTA_GROUP"
+    echo "Retention: $RETAIN_DAILY daily, $RETAIN_WEEKLY weekly, $RETAIN_MONTHLY monthly, $RETAIN_YEARLY yearly"
+    echo
+    warn "This will:"
+    echo "  - Install packages: borgbackup, python3, libvirt, sudo, fzf"
+    echo "  - Create user/group if they don't exist"
+    echo "  - Create backup directories"
+    echo "  - Initialize Borg repositories"
+    echo "  - Install backup scripts and aliases"
+    echo
+    read -p "$(question "Proceed with installation? [y/N]: ")" confirm
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        info "Installation cancelled"
+        exit 0
+    fi
+    
+    # --- Installation Steps ---
+    
+    info "Starting installation..."
+    
+    # Install packages (including fzf)
+    install_packages "$PACKAGE_MANAGER"
+    
+    # Create user and group
+    if ! id -u "$DELTA_USER" >/dev/null 2>&1; then
+        info "Creating user: $DELTA_USER"
+        adduser --disabled-password --gecos "Delta Backup User" "$DELTA_USER"
+    else
+        info "User $DELTA_USER already exists"
+    fi
+    
+    if ! getent group "$DELTA_GROUP" >/dev/null; then
+        info "Creating group: $DELTA_GROUP"
+        groupadd "$DELTA_GROUP"
+    else
+        info "Group $DELTA_GROUP already exists"
+    fi
+    
+    # Add user to group
+    if ! id -nG "$DELTA_USER" | grep -qw "$DELTA_GROUP"; then
+        usermod -a -G "$DELTA_GROUP" "$DELTA_USER"
+        info "Added $DELTA_USER to group $DELTA_GROUP"
+    fi
+    
+    info "Users in $DELTA_GROUP group will have backup/restore rights"
+    
+    # Create backup directories
+    mkdir -p "$BACKUP_ROOT/host-backup" "$BACKUP_ROOT/vm-backup"
+    chown -R "$DELTA_USER:$DELTA_GROUP" "$BACKUP_ROOT"
+    chmod -R 2770 "$BACKUP_ROOT"  # setgid for group inheritance
+    
+    # Generate and install config
+    CONFIG_DST="/etc/delta-backup.conf"
+    generate_config "$CONFIG_DST"
+    chmod 0640 "$CONFIG_DST"
+    chown root:"$DELTA_GROUP" "$CONFIG_DST"
+    info "Configuration file installed: $CONFIG_DST"
+    
+    # Create passphrase files
+    create_passfiles "$DELTA_USER" "$DELTA_GROUP" "$REPO_PASSWORD"
+    
+    # Install backup script and aliases
+    install_backup_script "$BACKUP_SCRIPT_SRC" "$INSTALL_DIR"
+    setup_shell_aliases "$DELTA_USER" "$INSTALL_DIR"
+    
+    # Initialize repositories
+    init_repositories "$DELTA_USER" "$BACKUP_ROOT/host-backup" "$BACKUP_ROOT/vm-backup" "borg"
+    
+    # --- Completion ---
+    echo
+    info "=== Installation Complete ==="
+    info "Delta Backup has been successfully installed!"
+    echo
+    info "Important Files:"
+    info "  Config: /etc/delta-backup.conf"
+    info "  Backup script: $INSTALL_DIR/delta-backup"
+    info "  Restore helper: $INSTALL_DIR/delta-restore"
+    echo
+    info "Usage:"
+    info "  Run backup:  sudo backup"
+    info "  Get restore help:  restore"
+    echo
+    info "Key Features:"
+    info "  - Automatic VM backup with verification"
+    info "  - Host system backup (excluding backup storage)"
+    info "  - Retention: $RETAIN_DAILY days, $RETAIN_WEEKLY weeks, $RETAIN_MONTHLY months, $RETAIN_YEARLY years"
+    info "  - All users in '$DELTA_GROUP' group have backup rights"
+    info "  - fzf installed for interactive restore operations"
+    echo
+    warn "Next steps:"
+    echo "  1. Test the backup system: sudo backup"
+    echo "  2. Add other users to '$DELTA_GROUP' group if needed:"
+    echo "     sudo usermod -a -G $DELTA_USER username"
+    echo "  3. Set up automatic backups in cron"
+    echo
+    info "For support, check the documentation or contact maxhaase@gmail.com"
+}
+
+# Run main installation
+main "$@"
