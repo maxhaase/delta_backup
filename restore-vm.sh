@@ -1,281 +1,78 @@
-#!/usr/bin/env bash
-set -euo pipefail
-
-# ===============================================
-# delta-restore-vm.sh — Restore a single VM from delta-backup
-# Reads config from /etc/delta_backup.conf [delta]
+#!/bin/bash
+# ==============================================================
+# Project: delta-backup - Restore backups created by backup.py
 # Author: Max Haase – maxhaase@gmail.com
-# ===============================================
+# ==============================================================
 
-CONF_FILE="${DELTA_CONF:-/etc/delta_backup.conf}"
+CONFIG_FILE="/etc/delta-backup.conf"
 
-die()  { echo "[ERROR] $*" >&2; exit 1; }
-warn() { echo "[WARN]  $*" >&2; }
-info() { echo "[INFO]  $*"; }
-
-need_cmd() { command -v "$1" >/dev/null 2>&1 || die "Missing command: $1"; }
-
-usage() {
-  cat >&2 <<EOF
-Usage: $0 [--config /path/to/delta_backup.conf]
-
-Environment:
-  DELTA_CONF=/etc/delta_backup.conf   (default)
-
-This restores a VM from the VM repository defined in the [delta] section.
-EOF
-  exit 1
+# === Function: Print error and exit ===
+die() {
+    echo -e "\033[1;31m[ERROR]\033[0m $*" >&2
+    exit 1
 }
 
-# ----------------------------
-# Parse args
-# ----------------------------
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --config) shift; [[ $# -gt 0 ]] || usage; CONF_FILE="$1"; shift ;;
-    -h|--help) usage ;;
-    *) usage ;;
-  endesac
-done
-
-# ----------------------------
-# Tiny INI parser for [delta]
-# ----------------------------
-trim() { sed -e 's/^[[:space:]]\+//' -e 's/[[:space:]]\+$//'; }
-
-boolify() {
-  local v="$(echo -n "$1" | tr '[:upper:]' '[:lower:]')"
-  case "$v" in
-    1|y|yes|true|on) echo 1 ;;
-    0|n|no|false|off|"") echo 0 ;;
-    *) echo 0 ;;
-  esac
+# === Function: Parse config ===
+parse_config() {
+    local key="$1"
+    grep -Ei "^${key}[[:space:]]*=" "$CONFIG_FILE" | sed 's/#.*//' | sed 's/^[^=]*=//' | tr -d ' '
 }
 
-declare \
-  CFG_backup_root="" \
-  CFG_host_repo="" \
-  CFG_vm_repo="" \
-  CFG_host_passfile="" \
-  CFG_vm_passfile="" \
-  CFG_require_mountpoint="0" \
-  CFG_lock_wait="120"
+# === Load configuration ===
+[ -f "$CONFIG_FILE" ] || die "Config not found: $CONFIG_FILE"
 
-[[ -r "$CONF_FILE" ]] || die "Config not readable: $CONF_FILE"
+VM_REPO=$(parse_config "vm_repo")
+HOST_REPO=$(parse_config "host_repo")
+VM_PASSFILE=$(parse_config "vm_passfile")
+HOST_PASSFILE=$(parse_config "host_passfile")
 
-# Read only the [delta] section; strip comments; capture key=val
-while IFS='=' read -r k v; do
-  [[ -z "${k:-}" ]] && continue
-  case "$k" in
-    \#*|';'*) continue ;;
-  esac
-  k="$(echo "$k"   | sed 's/[[:space:]]\+$//' | sed 's/^[[:space:]]\+//' )"
-  v="$(echo "$v"   | sed 's/#.*$//'         | trim)"
-  case "$k" in
-    backup_root)          CFG_backup_root="$v" ;;
-    host_repo)            CFG_host_repo="$v" ;;
-    vm_repo)              CFG_vm_repo="$v" ;;
-    host_passfile)        CFG_host_passfile="$v" ;;
-    vm_passfile)          CFG_vm_passfile="$v" ;;
-    require_mountpoint)   CFG_require_mountpoint="$(boolify "$v")" ;;
-    lock_wait)            CFG_lock_wait="$v" ;;
-  esac
-done < <(
-  awk '
-    BEGIN{in=0}
-    /^\s*\[delta\]\s*(#.*)?$/ {in=1; next}
-    /^\s*\[/ {in=0}
-    in {
-      line=$0
-      sub(/;.*/,"",line)
-      # keep only lines containing "=" (key = value)
-      if (line ~ /=/) {
-        # remove inline comments starting with "#"
-        sub(/#[^"].*$/,"",line)
-        gsub(/\r/,"",line)
-        print line
-      }
-    }
-  ' "$CONF_FILE"
-)
+[ -d "$VM_REPO" ]     || die "Missing VM repository: $VM_REPO"
+[ -d "$HOST_REPO" ]   || die "Missing host repository: $HOST_REPO"
+[ -f "$VM_PASSFILE" ] || die "Missing VM passfile: $VM_PASSFILE"
+[ -f "$HOST_PASSFILE" ] || die "Missing host passfile: $HOST_PASSFILE"
 
-# ----------------------------
-# Sanity checks
-# ----------------------------
-need_cmd borg
-need_cmd awk
-need_cmd sed
-need_cmd grep
-need_cmd virsh
+# === Ensure fzf is installed ===
+command -v fzf >/dev/null || die "'fzf' not found – please install it first (apt install fzf)"
 
-[[ -n "$CFG_vm_repo" ]]      || die "vm_repo missing in [delta] of $CONF_FILE"
-[[ -d "$CFG_vm_repo" ]]      || die "vm_repo does not exist: $CFG_vm_repo"
-[[ -f "$CFG_vm_repo/config" ]] || die "vm_repo is not a borg repo (missing config): $CFG_vm_repo"
+# === Select which repo to restore ===
+echo -e "\n\033[1;36mSelect the repository to restore from:\033[0m"
+echo -e "\033[1;33mUse the \033[1mUP\033[0;33m and \033[1mDOWN\033[0;33m arrow keys to navigate. Press \033[1mENTER\033[0;33m to select.\033[0m"
 
-[[ -n "$CFG_backup_root" ]]  || warn "backup_root missing; skipping mountpoint check."
-if [[ "$CFG_require_mountpoint" == "1" && -n "$CFG_backup_root" ]]; then
-  need_cmd findmnt
-  if ! findmnt -rno TARGET "$CFG_backup_root" >/dev/null 2>&1; then
-    die "require_mountpoint=true but $CFG_backup_root is not a mountpoint."
-  fi
-fi
+REPO_SELECTION=$(printf "Host backup  [%s]\nVM backup    [%s]" "$HOST_REPO" "$VM_REPO" | fzf --ansi --prompt="Repository: ")
 
-# Pass handling
-if [[ -n "$CFG_vm_passfile" ]]; then
-  [[ -r "$CFG_vm_passfile" ]] || die "vm_passfile not readable: $CFG_vm_passfile"
-  export BORG_PASSCOMMAND="cat $CFG_vm_passfile"
-  info "Using vm_passfile: $CFG_vm_passfile"
+case "$REPO_SELECTION" in
+  Host*)  REPO="$HOST_REPO"; PASSFILE="$HOST_PASSFILE" ;;
+  VM*)    REPO="$VM_REPO";   PASSFILE="$VM_PASSFILE" ;;
+  *)      die "No repository selected" ;;
+esac
+
+# === Select archive ===
+export BORG_PASSCOMMAND="cat $PASSFILE"
+
+mapfile -t ARCHIVES < <(borg list "$REPO" --format '{archive}{NL}' 2>/dev/null)
+[ ${#ARCHIVES[@]} -eq 0 ] && die "No archives found in $REPO"
+
+echo -e "\n\033[1;36mSelect archive to restore:\033[0m"
+echo -e "\033[1;33mUse arrow keys to navigate. Press ENTER to select.\033[0m"
+
+ARCHIVE=$(printf "%s\n" "${ARCHIVES[@]}" | fzf --ansi --prompt="Archive: ")
+[ -n "$ARCHIVE" ] || die "No archive selected"
+
+# === Select extract destination ===
+echo -e "\n\033[1;36mChoose extract location:\033[0m"
+read -rp "Target directory (default: current dir): " TARGET
+TARGET="${TARGET:-.}"
+mkdir -p "$TARGET" || die "Cannot create $TARGET"
+
+# === Extract ===
+echo -e "\n\033[1;32m[INFO]\033[0m Extracting archive: $ARCHIVE"
+echo -e "\033[1;32m[INFO]\033[0m Target directory: $TARGET"
+
+borg extract "$REPO::$ARCHIVE" --progress --verbose --show-rc --filter=AME --strip-components 1 -C "$TARGET"
+RC=$?
+
+if [[ $RC -eq 0 ]]; then
+    echo -e "\n\033[1;32m[SUCCESS]\033[0m Archive extracted to: $TARGET"
 else
-  # fallback to interactive
-  printf "Enter VM repo passphrase (input hidden): " >/dev/tty
-  read -rs PASSPH </dev/tty
-  echo >/dev/tty
-  [[ -n "${PASSPH:-}" ]] || die "Empty passphrase."
-  export BORG_PASSPHRASE="$PASSPH"
-  info "Using interactive passphrase."
+    echo -e "\n\033[1;31m[FAILURE]\033[0m borg extract exited with code $RC"
 fi
-
-REPO="$CFG_vm_repo"
-info "VM repository: $REPO"
-
-# --------------------------------------
-# Archive menu (newest first, one per line)
-# --------------------------------------
-choose_archive() {
-  local repo="$1"
-  local -a ARCHIVES=()
-  LC_ALL=C readarray -t ARCHIVES < <(borg list "$repo" --format '{archive}{NL}' | sort -r | head -n 50)
-  ((${#ARCHIVES[@]})) || die "No archives found in $repo"
-
-  echo "=== Available VM backups (latest 50) ===" >/dev/tty
-  for i in "${!ARCHIVES[@]}"; do
-    printf "%2d) %s\n" $((i+1)) "${ARCHIVES[i]}" >/dev/tty
-  done
-
-  local sel
-  while true; do
-    printf "Choose an archive [1-%d]: " "${#ARCHIVES[@]}" >/dev/tty
-    read -r sel </dev/tty
-    [[ "$sel" =~ ^[0-9]+$ ]] && (( sel>=1 && sel<=${#ARCHIVES[@]} )) && { echo "${ARCHIVES[sel-1]}"; return; }
-    echo "Invalid selection." >/dev/tty
-  done
-}
-
-# --------------------------------------
-# Archive contents → paths
-# --------------------------------------
-archive_paths() {
-  local repo="$1" arch="$2"
-  borg list "$repo"::"$arch" --format '{path}{NL}'
-}
-
-# --------------------------------------
-# Derive VM names from XMLs/disks
-# --------------------------------------
-derive_vm_names() {
-  awk '
-    /^etc\/libvirt\/qemu\/[^/]+\.xml$/ {
-      n=$0; sub(/^etc\/libvirt\/qemu\//,"",n); sub(/\.xml$/,"",n); xml[n]=1
-    }
-    /^var\/lib\/libvirt\/images\/[^/]+\.(qcow2|qcow|img|raw)$/ {
-      n=$0; sub(/^var\/lib\/libvirt\/images\//,"",n)
-      sub(/\.(qcow2|qcow|img|raw)$/,"",n)
-      sub(/-.*/,"",n)
-      img[n]=1
-    }
-    END {
-      c=0
-      for (n in xml) { print n; c++ }
-      if (c==0) for (n in img) print n
-    }
-  '
-}
-
-choose_vm() {
-  local names=("$@")
-  ((${#names[@]})) || die "No VMs detected."
-  echo "=== VMs present in the archive ===" >/dev/tty
-  for i in "${!names[@]}"; do
-    printf "%2d) %s\n" $((i+1)) "${names[i]}" >/dev/tty
-  done
-  local sel
-  while true; do
-    printf "Choose a VM [1-%d]: " "${#names[@]}" >/dev/tty
-    read -r sel </dev/tty
-    [[ "$sel" =~ ^[0-9]+$ ]] && (( sel>=1 && sel<=${#names[@]} )) && { echo "${names[sel-1]}"; return; }
-    echo "Invalid selection." >/dev/tty
-  done
-}
-
-# --------------------------------------
-# Collect all files for a VM
-# --------------------------------------
-collect_vm_files() {
-  local vm="$1"
-  awk -v vm="$vm" '
-    $0 ~ "^var/lib/libvirt/images/" vm "\\.(qcow2|qcow|img|raw)$" { print; next }
-    $0 ~ "^var/lib/libvirt/images/" vm "-[^/]+\\.(qcow2|qcow|img|raw)$" { print; next }
-    $0 ~ "^var/lib/libvirt/images/[^/]*" vm "[^/]*\\.(qcow2|qcow|img|raw)$" { print; next }
-    $0 == "etc/libvirt/qemu/" vm ".xml" { print; next }
-  '
-}
-
-main() {
-  local ARCHIVE VM_NAME
-  ARCHIVE="$(choose_archive "$REPO")"
-  info "Selected archive: $ARCHIVE"
-
-  local -a PATHS=()
-  LC_ALL=C readarray -t PATHS < <(archive_paths "$REPO" "$ARCHIVE")
-
-  local -a VM_NAMES=()
-  LC_ALL=C readarray -t VM_NAMES < <(printf '%s\n' "${PATHS[@]}" | derive_vm_names | sort -u)
-  ((${#VM_NAMES[@]})) || die "No VMs found in archive $ARCHIVE."
-
-  VM_NAME="$(choose_vm "${VM_NAMES[@]}")"
-  info "Selected VM: $VM_NAME"
-
-  local -a VM_FILES=()
-  LC_ALL=C readarray -t VM_FILES < <(printf '%s\n' "${PATHS[@]}" | collect_vm_files "$VM_NAME" | sort -u)
-  ((${#VM_FILES[@]})) || die "No files for VM '$VM_NAME' in archive '$ARCHIVE'."
-
-  echo "=== Plan ==="
-  echo "Archive: $ARCHIVE"
-  echo "VM:      $VM_NAME"
-  echo "Files:"
-  for f in "${VM_FILES[@]}"; do echo "  /$f"; done
-  echo
-
-  local OVERWRITE=0
-  for f in "${VM_FILES[@]}"; do
-    [[ -e "/$f" ]] && { warn "Target exists: /$f"; OVERWRITE=1; }
-  done
-  if (( OVERWRITE )); then
-    printf "Overwrite existing files? [y/N] " >/dev/tty
-    read -r ans </dev/tty
-    case "${ans:-}" in y|Y|yes|YES) ;; *) echo "Aborted." >/dev/tty; exit 1 ;; esac
-  fi
-
-  mkdir -p /var/lib/libvirt/images
-  mkdir -p /etc/libvirt/qemu
-
-  echo "=== Extracting files ==="
-  cd /
-  borg extract --lock-wait "${CFG_lock_wait}" --progress "$REPO"::"$ARCHIVE" "${VM_FILES[@]}"
-
-  if [[ -e "/etc/libvirt/qemu/${VM_NAME}.xml" ]]; then
-    info "Defining VM ${VM_NAME} ..."
-    virsh define "/etc/libvirt/qemu/${VM_NAME}.xml" || true
-  else
-    warn "No XML found for ${VM_NAME}; assuming VM is already defined."
-  fi
-
-  info "Starting VM ${VM_NAME} ..."
-  if ! virsh start "${VM_NAME}"; then
-    warn "Could not start VM ${VM_NAME} automatically. Check with: virsh list --all"
-  fi
-
-  echo "=== Done restoring VM '${VM_NAME}' from archive '${ARCHIVE}'. ==="
-}
-
-main
