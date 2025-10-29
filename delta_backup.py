@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 # ==============================================================
 # Project: delta-backup - Safe cold backup of host and VMs
-# Customized for use with VMM (libvirt)
 # Author: Max Haase – maxhaase@gmail.com
 # License: MIT
 # ==============================================================
@@ -17,12 +16,36 @@ def die(msg, rc=1):
     print(f"[ERROR] {msg}", file=sys.stderr)
     sys.exit(rc)
 
-def run(cmd, check=True, capture_output=False, env=None):
+def run(cmd, check=True, capture_output=False, env=None, show_progress=False):
     """Run a shell command with logging."""
     if isinstance(cmd, str):
         cmd = shlex.split(cmd)
     print(f"[CMD] {' '.join(shlex.quote(c) for c in cmd)}")
-    return subprocess.run(cmd, check=check, capture_output=capture_output, text=True, env=env)
+    
+    if show_progress:
+        # For Borg commands, we want to see progress output
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, 
+                                 text=True, env=env, bufsize=1, universal_newlines=True)
+        
+        # Print output in real-time with progress indicators
+        while True:
+            output = process.stdout.readline()
+            if output == '' and process.poll() is not None:
+                break
+            if output:
+                # Filter for progress-related output
+                if any(progress_indicator in output for progress_indicator in 
+                       ['%', 'MB', 'GB', 'kB/s', 'ETA:', 'Processing']):
+                    print(f"[PROGRESS] {output.strip()}")
+                else:
+                    print(f"[OUTPUT] {output.strip()}")
+        
+        rc = process.poll()
+        if check and rc != 0:
+            die(f"Command failed with exit code {rc}")
+        return rc
+    else:
+        return subprocess.run(cmd, check=check, capture_output=capture_output, text=True, env=env).returncode
 
 def clean_config_value(value):
     if not value:
@@ -40,29 +63,27 @@ def load_config():
     delta = config['delta']
     backup_root = clean_config_value(delta.get('backup_root'))
     host_repo = clean_config_value(delta.get('host_repo'))
-    vm_repo = clean_config_value(delta.get('vm_repo'))
     host_passfile = clean_config_value(delta.get('host_passfile'))
-    vm_passfile = clean_config_value(delta.get('vm_passfile'))
     host_excludes = [x.strip() for x in clean_config_value(delta.get('host_excludes', '')).split(',') if x.strip()]
     extra_paths = [x.strip() for x in clean_config_value(delta.get('extra_paths', '')).split(',') if x.strip()]
-
-    # Always exclude VM disk directory to prevent duplication
-    if "/var/lib/libvirt/images" not in host_excludes:
-        host_excludes.append("/var/lib/libvirt/images")
-    host_excludes.append("*.qcow2")
+    
+    # Load include_paths from config, fall back to default if not specified
+    include_paths_config = clean_config_value(delta.get('include_paths', ''))
+    if include_paths_config:
+        include_paths = [x.strip() for x in include_paths_config.split(',') if x.strip()]
+    else:
+        # Default include paths if not specified in config
+        include_paths = ["/bin", "/boot", "/etc", "/home", "/lib", "/lib64", "/opt", "/root", "/sbin", "/srv", "/usr", "/var"]
 
     return {
         'backup_root': backup_root,
         'host_repo': host_repo,
-        'vm_repo': vm_repo,
         'host_passfile': host_passfile,
-        'vm_passfile': vm_passfile,
         'host_excludes': host_excludes,
+        'include_paths': include_paths,
         'extra_paths': extra_paths,
         'extra_prefix': clean_config_value(delta.get('extra_prefix', 'extra')),
         'lock_file': clean_config_value(delta.get('lock_file', '/var/lock/max-backup.lock')),
-        'vm_shutdown_timeout': int(clean_config_value(delta.get('vm_shutdown_timeout', '600'))),
-        'vm_startup_grace': int(clean_config_value(delta.get('vm_startup_grace', '5'))),
         'engine_compression': clean_config_value(delta.get('engine_compression', 'zstd,6')),
         'engine_filter': clean_config_value(delta.get('engine_filter', 'AME')),
         'engine_files_cache': clean_config_value(delta.get('engine_files_cache', 'ctime,size,inode')),
@@ -71,13 +92,9 @@ def load_config():
 
 CONFIG = load_config()
 HOST_REPO = CONFIG['host_repo']
-VM_REPO = CONFIG['vm_repo']
 HOST_PASSFILE = CONFIG['host_passfile']
-VM_PASSFILE = CONFIG['vm_passfile']
 LOCK_FILE = CONFIG['lock_file']
-STAGING_DIR = os.path.join(VM_REPO, ".staging")
-CRITICAL_VMS = ["PROD"]
-INCLUDE_PATHS = ["/bin", "/boot", "/etc", "/home", "/lib", "/lib64", "/opt", "/root", "/sbin", "/srv", "/usr", "/var"]
+INCLUDE_PATHS = CONFIG['include_paths']  # Now loaded from config
 
 # === LOCK HANDLING ===
 def acquire_lock():
@@ -108,7 +125,7 @@ def borg_create(repo, passfile, sources, excludes=None, prefix=None, comment=Non
     archive = f"{(prefix or hostname)}-{datetime.utcnow().strftime('%Y-%m-%d_%H-%M')}"
     archive_loc = f"{repo}::{archive}"
     cmd = [
-        "borg", "create", "--verbose", "--stats", "--show-rc", "--list",
+        "borg", "create", "--verbose", "--stats", "--show-rc", "--list", "--progress",
         "--filter", CONFIG['engine_filter'], "--compression", CONFIG['engine_compression'],
         "--comment", comment or f"Backup on {hostname}"
     ]
@@ -119,62 +136,30 @@ def borg_create(repo, passfile, sources, excludes=None, prefix=None, comment=Non
             cmd.extend(["--exclude", ex])
     cmd.append(archive_loc)
     cmd.extend(sources)
-    return run(cmd, check=False, env=borg_env(passfile)).returncode
+    
+    print(f"[INFO] Starting backup: {archive}")
+    print(f"[INFO] Sources: {sources}")
+    if excludes:
+        print(f"[INFO] Excludes: {excludes}")
+    
+    return run(cmd, check=False, env=borg_env(passfile), show_progress=True)
 
-# === VM BACKUP HANDLING ===
-def shutdown_vm(vm):
-    run(["virsh", "shutdown", vm])
-    print(f"[INFO] Waiting for VM {vm} to shut down…")
-    for _ in range(CONFIG['vm_shutdown_timeout']):
-        state = subprocess.run(["virsh", "domstate", vm], capture_output=True, text=True).stdout.strip().lower()
-        if state == "shut off":
-            print(f"[INFO] VM {vm} is shut off.")
-            return
-        time.sleep(1)
-    die(f"VM {vm} did not shut down in time")
-
-def start_vm(vm):
-    run(["virsh", "start", vm])
-    print(f"[INFO] VM {vm} started.")
-    time.sleep(CONFIG['vm_startup_grace'])
-
-def ensure_vm_running(vm):
-    state = subprocess.run(["virsh", "domstate", vm], capture_output=True, text=True).stdout.strip().lower()
-    if state not in ["running", "idle"]:
-        print(f"[WARN] VM {vm} is not running, attempting restart…")
-        start_vm(vm)
-
-def copy_with_progress(src, dst):
-    """Copy file with pv or rsync progress."""
-    try:
-        if shutil.which("pv"):
-            size_bytes = os.path.getsize(src)
-            size_mb = size_bytes // (1024 * 1024)
-            print(f"[INFO] Copying with progress: {src} -> {dst} ({size_mb} MB)")
-            subprocess.run(f"pv '{src}' > '{dst}'", shell=True, check=True)
-        elif shutil.which("rsync"):
-            print(f"[INFO] Copying with rsync progress: {src} -> {dst}")
-            run(["rsync", "-ah", "--info=progress2", src, dst])
-        else:
-            print("[INFO] Copying without progress (no pv or rsync available)")
-            run(["cp", "--sparse=always", src, dst])
-    except Exception as e:
-        print(f"[ERROR] Copy failed: {e}")
-        die("Copying VM image failed")
-
-def backup_vm_disks(vm, out_dir):
-    os.makedirs(out_dir, exist_ok=True)
-    disk = f"/var/lib/libvirt/images/{vm}.qcow2"
-    if not os.path.exists(disk):
-        print(f"[ERROR] Disk not found for VM {vm}: {disk}")
-        return []
-    dest = os.path.join(out_dir, os.path.basename(disk))
-    print(f"[INFO] Copying {disk} to {dest}")
-    copy_with_progress(disk, dest)
-    xml = os.path.join(out_dir, f"{vm}.xml")
-    with open(xml, "w") as f:
-        subprocess.run(["virsh", "dumpxml", vm], stdout=f, check=True)
-    return [dest, xml]
+def estimate_backup_size(sources):
+    """Estimate total backup size for progress context"""
+    total_size = 0
+    for source in sources:
+        if os.path.exists(source):
+            if os.path.isfile(source):
+                total_size += os.path.getsize(source)
+            else:
+                for dirpath, dirnames, filenames in os.walk(source):
+                    for filename in filenames:
+                        filepath = os.path.join(dirpath, filename)
+                        try:
+                            total_size += os.path.getsize(filepath)
+                        except OSError:
+                            pass
+    return total_size
 
 # === MAIN LOGIC ===
 def main():
@@ -185,7 +170,16 @@ def main():
     hostname = socket.gethostname()
 
     try:
-        print("\n=== HOST BACKUP ===")
+        print("\n=== HOST BACKUP (including VM images) ===")
+        print("[INFO] VM disk images in /var/lib/libvirt/images are now included in host backup")
+        
+        # Estimate size for user information
+        print("[INFO] Estimating backup size...")
+        estimated_size = estimate_backup_size(INCLUDE_PATHS)
+        size_gb = estimated_size / (1024**3)
+        print(f"[INFO] Estimated backup size: {size_gb:.2f} GB")
+        print("[INFO] Starting Borg backup with progress monitoring...")
+        
         rc = borg_create(HOST_REPO, HOST_PASSFILE, INCLUDE_PATHS, excludes=CONFIG['host_excludes'], prefix=hostname)
         if rc != 0:
             print("[WARN] Host backup completed with warnings")
@@ -193,30 +187,23 @@ def main():
         print("\n=== EXTRA PATHS BACKUP ===")
         for i, path in enumerate(CONFIG['extra_paths']):
             if os.path.exists(path):
+                print(f"[INFO] Backing up extra path: {path}")
                 prefix = f"{hostname}-{CONFIG['extra_prefix']}-{i}"
                 borg_create(HOST_REPO, HOST_PASSFILE, [path], prefix=prefix, comment=f"Extra path {path}")
             else:
                 print(f"[SKIP] Extra path not found: {path}")
 
-        print("\n=== VM BACKUPS ===")
-        for vm in CRITICAL_VMS:
-            print(f"\n--- VM: {vm} ---")
-            staging = os.path.join(STAGING_DIR, vm)
-            if os.path.exists(staging):
-                shutil.rmtree(staging)
-            try:
-                shutdown_vm(vm)
-                files = backup_vm_disks(vm, staging)
-            finally:
-                start_vm(vm)
-            if files:
-                borg_create(VM_REPO, VM_PASSFILE, [staging], prefix=f"{hostname}-{vm}", comment=f"Cold backup for {vm}")
+        print("\n=== VM STATUS CHECK ===")
+        # Check if VMs are running (informational only)
+        try:
+            result = subprocess.run(["virsh", "list", "--name"], capture_output=True, text=True)
+            running_vms = [vm.strip() for vm in result.stdout.splitlines() if vm.strip()]
+            if running_vms:
+                print(f"[INFO] Currently running VMs: {', '.join(running_vms)}")
             else:
-                print(f"[WARN] No VM disks found for {vm}")
-
-        print("\n=== FINAL CHECK ===")
-        for vm in CRITICAL_VMS:
-            ensure_vm_running(vm)
+                print("[INFO] No VMs currently running")
+        except Exception as e:
+            print(f"[INFO] Could not check VM status: {e}")
 
     finally:
         release_lock()
@@ -226,5 +213,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
