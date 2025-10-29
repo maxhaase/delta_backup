@@ -16,6 +16,27 @@ def die(msg, rc=1):
     print(f"[ERROR] {msg}", file=sys.stderr)
     sys.exit(rc)
 
+def format_size(size_bytes):
+    """Convert bytes to human readable format"""
+    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+        if size_bytes < 1024.0:
+            return f"{size_bytes:.1f} {unit}"
+        size_bytes /= 1024.0
+    return f"{size_bytes:.1f} PB"
+
+def format_duration(seconds):
+    """Convert seconds to human readable duration"""
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    elif seconds < 3600:
+        minutes = seconds // 60
+        seconds = seconds % 60
+        return f"{minutes:.0f}m {seconds:.0f}s"
+    else:
+        hours = seconds // 3600
+        minutes = (seconds % 3600) // 60
+        return f"{hours:.0f}h {minutes:.0f}m"
+
 def run(cmd, check=True, capture_output=False, env=None, show_progress=False):
     """Run a shell command with logging."""
     if isinstance(cmd, str):
@@ -23,15 +44,17 @@ def run(cmd, check=True, capture_output=False, env=None, show_progress=False):
     print(f"[CMD] {' '.join(shlex.quote(c) for c in cmd)}")
     
     if show_progress:
-        # For Borg commands, we want to see progress output
+        # For Borg commands, we want to see proper progress output
         process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, 
                                  text=True, env=env, bufsize=1, universal_newlines=True)
         
-        # Track large files and provide better progress
-        large_files_seen = set()
-        current_large_file = None
+        # Progress tracking variables
+        backup_start_time = time.time()
+        last_progress_time = backup_start_time
+        current_file = None
+        file_start_time = None
         
-        # Print output in real-time with progress indicators
+        # Print output in real-time with proper progress formatting
         while True:
             output = process.stdout.readline()
             if output == '' and process.poll() is not None:
@@ -39,34 +62,59 @@ def run(cmd, check=True, capture_output=False, env=None, show_progress=False):
             if output:
                 line = output.strip()
                 
-                # Detect when Borg starts processing large files (like VM images)
-                if 'home/libvirt/images' in line and '.qcow2' in line:
-                    if line not in large_files_seen:
-                        large_files_seen.add(line)
-                        print(f"[PROGRESS] Processing large VM file: {line.split()[-1]}")
-                        current_large_file = line.split()[-1]
-                
-                # Show progress for large files with timestamps
-                if current_large_file and any(x in line for x in ['GB', 'MB']):
-                    # Extract progress info
+                # Parse Borg's progress output
+                if any(x in line for x in ['GB', 'MB', 'KB', 'B O']):
+                    # This is a progress line like: "21.37 GB O 10.61 GB C 66.84 MB D 1780 N filename"
                     parts = line.split()
-                    if len(parts) >= 6:
-                        original_size = parts[1] + ' ' + parts[2]  # e.g., "21.37 GB"
-                        compressed_size = parts[4] + ' ' + parts[5]  # e.g., "10.61 GB"
-                        timestamp = datetime.now().strftime("%H:%M:%S")
-                        print(f"[PROGRESS] {timestamp} - {current_large_file}: {original_size} → {compressed_size}")
-                
-                # Show regular progress for other files
-                elif any(progress_indicator in line for progress_indicator in 
-                       ['%', 'ETA:', 'Processing']):
-                    print(f"[PROGRESS] {line}")
+                    if len(parts) >= 10:
+                        try:
+                            original_size = float(parts[0])
+                            original_unit = parts[1]
+                            compressed_size = float(parts[3])
+                            compressed_unit = parts[4]
+                            deduplicated_size = float(parts[6])
+                            deduplicated_unit = parts[7]
+                            file_count = parts[9]
+                            filename = ' '.join(parts[10:]) if len(parts) > 10 else 'unknown'
+                            
+                            current_time = time.time()
+                            elapsed = current_time - backup_start_time
+                            
+                            # Calculate progress for current file
+                            if original_unit == 'GB':
+                                total_bytes = original_size * 1024 * 1024 * 1024
+                            elif original_unit == 'MB':
+                                total_bytes = original_size * 1024 * 1024
+                            elif original_unit == 'KB':
+                                total_bytes = original_size * 1024
+                            else:
+                                total_bytes = original_size
+                            
+                            # Only show progress every 2 seconds to avoid spam
+                            if current_time - last_progress_time >= 2.0:
+                                print(f"\n[PROGRESS] File: {filename}")
+                                print(f"           Size: {original_size:.2f} {original_unit} → {compressed_size:.2f} {compressed_unit} (compressed)")
+                                print(f"           Deduplicated: {deduplicated_size:.2f} {deduplicated_unit}")
+                                print(f"           Files processed: {file_count}")
+                                print(f"           Elapsed: {format_duration(elapsed)}")
+                                last_progress_time = current_time
+                                
+                        except (ValueError, IndexError):
+                            # If parsing fails, show the raw line
+                            if 'Processing' in line or any(x in line for x in ['.qcow2', '.img']):
+                                print(f"\n[PROGRESS] Processing: {line}")
                 
                 # Show file counts and stats
                 elif 'files:' in line.lower() or 'directories:' in line.lower():
-                    print(f"[STATS] {line}")
+                    print(f"\n[STATS] {line}")
                 
-                else:
-                    print(f"[OUTPUT] {line}")
+                # Show ETA information
+                elif 'ETA:' in line:
+                    print(f"[PROGRESS] {line}")
+                
+                # Show regular output for other important messages
+                elif any(msg in line for msg in ['Archive', 'Time', 'Duration', 'compressed']):
+                    print(f"[INFO] {line}")
         
         rc = process.poll()
         if check and rc != 0:
@@ -169,6 +217,7 @@ def borg_create(repo, passfile, sources, excludes=None, prefix=None, comment=Non
     print(f"[INFO] Sources: {sources}")
     if excludes:
         print(f"[INFO] Excludes: {excludes}")
+    print("[PROGRESS] Starting backup with detailed progress...\n")
     
     return run(cmd, check=False, env=borg_env(passfile), show_progress=True)
 
@@ -183,7 +232,6 @@ def main():
     try:
         print("\n=== HOST BACKUP (including VM images) ===")
         print("[INFO] VM disk images in /var/lib/libvirt/images are now included in host backup")
-        print("[INFO] Large VM files will show detailed progress with timestamps")
         
         rc = borg_create(HOST_REPO, HOST_PASSFILE, INCLUDE_PATHS, excludes=CONFIG['host_excludes'], prefix=hostname)
         if rc != 0:
