@@ -27,18 +27,46 @@ def run(cmd, check=True, capture_output=False, env=None, show_progress=False):
         process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, 
                                  text=True, env=env, bufsize=1, universal_newlines=True)
         
+        # Track large files and provide better progress
+        large_files_seen = set()
+        current_large_file = None
+        
         # Print output in real-time with progress indicators
         while True:
             output = process.stdout.readline()
             if output == '' and process.poll() is not None:
                 break
             if output:
-                # Filter for progress-related output
-                if any(progress_indicator in output for progress_indicator in 
-                       ['%', 'MB', 'GB', 'kB/s', 'ETA:', 'Processing']):
-                    print(f"[PROGRESS] {output.strip()}")
+                line = output.strip()
+                
+                # Detect when Borg starts processing large files (like VM images)
+                if 'home/libvirt/images' in line and '.qcow2' in line:
+                    if line not in large_files_seen:
+                        large_files_seen.add(line)
+                        print(f"[PROGRESS] Processing large VM file: {line.split()[-1]}")
+                        current_large_file = line.split()[-1]
+                
+                # Show progress for large files with timestamps
+                if current_large_file and any(x in line for x in ['GB', 'MB']):
+                    # Extract progress info
+                    parts = line.split()
+                    if len(parts) >= 6:
+                        original_size = parts[1] + ' ' + parts[2]  # e.g., "21.37 GB"
+                        compressed_size = parts[4] + ' ' + parts[5]  # e.g., "10.61 GB"
+                        timestamp = datetime.now().strftime("%H:%M:%S")
+                        print(f"[PROGRESS] {timestamp} - {current_large_file}: {original_size} → {compressed_size}")
+                
+                # Show regular progress for other files
+                elif any(progress_indicator in line for progress_indicator in 
+                       ['%', 'ETA:', 'Processing']):
+                    print(f"[PROGRESS] {line}")
+                
+                # Show file counts and stats
+                elif 'files:' in line.lower() or 'directories:' in line.lower():
+                    print(f"[STATS] {line}")
+                
                 else:
-                    print(f"[OUTPUT] {output.strip()}")
+                    print(f"[OUTPUT] {line}")
         
         rc = process.poll()
         if check and rc != 0:
@@ -144,23 +172,6 @@ def borg_create(repo, passfile, sources, excludes=None, prefix=None, comment=Non
     
     return run(cmd, check=False, env=borg_env(passfile), show_progress=True)
 
-def estimate_backup_size(sources):
-    """Estimate total backup size for progress context"""
-    total_size = 0
-    for source in sources:
-        if os.path.exists(source):
-            if os.path.isfile(source):
-                total_size += os.path.getsize(source)
-            else:
-                for dirpath, dirnames, filenames in os.walk(source):
-                    for filename in filenames:
-                        filepath = os.path.join(dirpath, filename)
-                        try:
-                            total_size += os.path.getsize(filepath)
-                        except OSError:
-                            pass
-    return total_size
-
 # === MAIN LOGIC ===
 def main():
     if os.geteuid() != 0:
@@ -172,13 +183,7 @@ def main():
     try:
         print("\n=== HOST BACKUP (including VM images) ===")
         print("[INFO] VM disk images in /var/lib/libvirt/images are now included in host backup")
-        
-        # Estimate size for user information
-        print("[INFO] Estimating backup size...")
-        estimated_size = estimate_backup_size(INCLUDE_PATHS)
-        size_gb = estimated_size / (1024**3)
-        print(f"[INFO] Estimated backup size: {size_gb:.2f} GB")
-        print("[INFO] Starting Borg backup with progress monitoring...")
+        print("[INFO] Large VM files will show detailed progress with timestamps")
         
         rc = borg_create(HOST_REPO, HOST_PASSFILE, INCLUDE_PATHS, excludes=CONFIG['host_excludes'], prefix=hostname)
         if rc != 0:
@@ -192,18 +197,6 @@ def main():
                 borg_create(HOST_REPO, HOST_PASSFILE, [path], prefix=prefix, comment=f"Extra path {path}")
             else:
                 print(f"[SKIP] Extra path not found: {path}")
-
-        print("\n=== VM STATUS CHECK ===")
-        # Check if VMs are running (informational only)
-        try:
-            result = subprocess.run(["virsh", "list", "--name"], capture_output=True, text=True)
-            running_vms = [vm.strip() for vm in result.stdout.splitlines() if vm.strip()]
-            if running_vms:
-                print(f"[INFO] Currently running VMs: {', '.join(running_vms)}")
-            else:
-                print("[INFO] No VMs currently running")
-        except Exception as e:
-            print(f"[INFO] Could not check VM status: {e}")
 
     finally:
         release_lock()
