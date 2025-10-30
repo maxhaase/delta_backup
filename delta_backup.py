@@ -6,7 +6,7 @@
 # ==============================================================
 
 import os, subprocess, shlex, time, socket, sys, shutil, configparser
-from datetime import datetime
+from datetime import datetime, timezone
 import xml.etree.ElementTree as ET
 
 CONFIG_FILE = "/etc/delta-backup.conf"
@@ -44,59 +44,11 @@ def run(cmd, check=True, capture_output=False, env=None, show_progress=False):
     print(f"[CMD] {' '.join(shlex.quote(c) for c in cmd)}")
     
     if show_progress:
-        # For Borg commands, let Borg output directly to terminal for proper progress display
-        # Borg sends progress to stderr, so we need to handle both stdout and stderr
-        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, 
-                                 text=True, env=env, bufsize=1, universal_newlines=True)
+        # For Borg commands, let it output directly to terminal for real-time progress
+        # This is crucial for Borg's progress display to work properly
+        process = subprocess.Popen(cmd, env=env)
+        rc = process.wait()
         
-        # Progress tracking variables
-        backup_start_time = time.time()
-        last_progress_time = backup_start_time
-        
-        # Print output in real-time from both stdout and stderr
-        while True:
-            # Check if process has finished
-            if process.poll() is not None:
-                # Read any remaining output
-                stdout, stderr = process.communicate()
-                if stdout:
-                    for line in stdout.splitlines():
-                        print(f"[BORG] {line}")
-                if stderr:
-                    for line in stderr.splitlines():
-                        print(f"[BORG] {line}")
-                break
-                
-            # Read from stdout
-            stdout_line = process.stdout.readline()
-            if stdout_line:
-                line = stdout_line.strip()
-                if line:  # Only print non-empty lines
-                    print(f"[BORG] {line}")
-            
-            # Read from stderr (where Borg progress goes)
-            stderr_line = process.stderr.readline()
-            if stderr_line:
-                line = stderr_line.strip()
-                if line:  # Only print non-empty lines
-                    # Parse Borg's progress output for better formatting
-                    current_time = time.time()
-                    elapsed = current_time - backup_start_time
-                    
-                    # Show progress lines with better formatting
-                    if any(x in line for x in ['GB', 'MB', 'KB', 'B O']):
-                        # Only show progress every 2 seconds to avoid spam
-                        if current_time - last_progress_time >= 2.0:
-                            print(f"[PROGRESS] {line} | Elapsed: {format_duration(elapsed)}")
-                            last_progress_time = current_time
-                    elif 'files:' in line.lower() or 'directories:' in line.lower():
-                        print(f"[STATS] {line}")
-                    elif 'ETA:' in line or 'Time:' in line or 'Duration:' in line:
-                        print(f"[PROGRESS] {line}")
-                    else:
-                        print(f"[BORG] {line}")
-        
-        rc = process.poll()
         if check and rc != 0:
             die(f"Command failed with exit code {rc}")
         return rc
@@ -140,6 +92,7 @@ def load_config():
         'extra_paths': extra_paths,
         'extra_prefix': clean_config_value(delta.get('extra_prefix', 'extra')),
         'lock_file': clean_config_value(delta.get('lock_file', '/var/lock/max-backup.lock')),
+        'lock_wait': clean_config_value(delta.get('lock_wait', '120')),
         'engine_compression': clean_config_value(delta.get('engine_compression', 'zstd,6')),
         'engine_filter': clean_config_value(delta.get('engine_filter', 'AME')),
         'engine_files_cache': clean_config_value(delta.get('engine_files_cache', 'ctime,size,inode')),
@@ -173,12 +126,13 @@ def borg_env(passfile):
     env = os.environ.copy()
     env["BORG_PASSCOMMAND"] = f"cat {passfile}"
     env["BORG_FILES_CACHE"] = CONFIG['engine_files_cache']
-    env["BORG_LOCK_WAIT"] = "60"
+    env["BORG_LOCK_WAIT"] = CONFIG['lock_wait']  # Use configured lock wait time
     return env
 
 def borg_create(repo, passfile, sources, excludes=None, prefix=None, comment=None):
     hostname = socket.gethostname()
-    archive = f"{(prefix or hostname)}-{datetime.utcnow().strftime('%Y-%m-%d_%H-%M')}"
+    # Fixed: Use timezone-aware datetime to avoid deprecation warning
+    archive = f"{(prefix or hostname)}-{datetime.now(timezone.utc).strftime('%Y-%m-%d_%H-%M')}"
     archive_loc = f"{repo}::{archive}"
     cmd = [
         "borg", "create", "--verbose", "--stats", "--show-rc", "--list", "--progress",
@@ -201,10 +155,52 @@ def borg_create(repo, passfile, sources, excludes=None, prefix=None, comment=Non
     
     return run(cmd, check=False, env=borg_env(passfile), show_progress=True)
 
+def check_and_fix_borg_lock():
+    """Check for Borg lock and break it if stale"""
+    lock_path = os.path.join(HOST_REPO, "lock")
+    lock_exempt_path = os.path.join(HOST_REPO, "lock.exclusive")
+    
+    # Check if lock files exist
+    has_lock = os.path.exists(lock_path) or os.path.exists(lock_exempt_path)
+    
+    if has_lock:
+        print(f"[WARN] Borg lock file(s) detected in {HOST_REPO}")
+        print("[INFO] Checking if lock is stale...")
+        
+        # Try to list repositories to see if we can access it
+        env = borg_env(HOST_PASSFILE)
+        test_cmd = ["borg", "list", "--short", HOST_REPO]
+        result = subprocess.run(test_cmd, env=env, capture_output=True, text=True)
+        
+        if result.returncode != 0 and "lock" in result.stderr:
+            print("[WARN] Repository appears to be locked. Breaking stale lock...")
+            
+            # Break the lock using borg break-lock
+            break_cmd = ["borg", "break-lock", HOST_REPO]
+            break_result = subprocess.run(break_cmd, env=env, capture_output=True, text=True)
+            
+            if break_result.returncode == 0:
+                print("[INFO] Successfully broke stale Borg lock")
+            else:
+                print(f"[ERROR] Failed to break lock: {break_result.stderr}")
+                print("[INFO] You may need to manually break the lock with: borg break-lock /STORE/BACKUP/host-backup")
+        else:
+            print("[INFO] Repository is accessible, lock appears to be valid")
+    else:
+        print("[INFO] No Borg lock files detected")
+
 # === MAIN LOGIC ===
 def main():
     if os.geteuid() != 0:
         die("Must be run as root")
+    
+    # Check if Borg repository exists and is accessible
+    if not os.path.exists(HOST_REPO):
+        die(f"Borg repository not found: {HOST_REPO}")
+    
+    # Check for stale Borg locks before starting
+    check_and_fix_borg_lock()
+    
     acquire_lock()
     start_time = time.time()
     hostname = socket.gethostname()
