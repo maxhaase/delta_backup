@@ -44,77 +44,57 @@ def run(cmd, check=True, capture_output=False, env=None, show_progress=False):
     print(f"[CMD] {' '.join(shlex.quote(c) for c in cmd)}")
     
     if show_progress:
-        # For Borg commands, we want to see proper progress output
-        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, 
+        # For Borg commands, let Borg output directly to terminal for proper progress display
+        # Borg sends progress to stderr, so we need to handle both stdout and stderr
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, 
                                  text=True, env=env, bufsize=1, universal_newlines=True)
         
         # Progress tracking variables
         backup_start_time = time.time()
         last_progress_time = backup_start_time
-        current_file = None
-        file_start_time = None
         
-        # Print output in real-time with proper progress formatting
+        # Print output in real-time from both stdout and stderr
         while True:
-            output = process.stdout.readline()
-            if output == '' and process.poll() is not None:
+            # Check if process has finished
+            if process.poll() is not None:
+                # Read any remaining output
+                stdout, stderr = process.communicate()
+                if stdout:
+                    for line in stdout.splitlines():
+                        print(f"[BORG] {line}")
+                if stderr:
+                    for line in stderr.splitlines():
+                        print(f"[BORG] {line}")
                 break
-            if output:
-                line = output.strip()
                 
-                # Parse Borg's progress output
-                if any(x in line for x in ['GB', 'MB', 'KB', 'B O']):
-                    # This is a progress line like: "21.37 GB O 10.61 GB C 66.84 MB D 1780 N filename"
-                    parts = line.split()
-                    if len(parts) >= 10:
-                        try:
-                            original_size = float(parts[0])
-                            original_unit = parts[1]
-                            compressed_size = float(parts[3])
-                            compressed_unit = parts[4]
-                            deduplicated_size = float(parts[6])
-                            deduplicated_unit = parts[7]
-                            file_count = parts[9]
-                            filename = ' '.join(parts[10:]) if len(parts) > 10 else 'unknown'
-                            
-                            current_time = time.time()
-                            elapsed = current_time - backup_start_time
-                            
-                            # Calculate progress for current file
-                            if original_unit == 'GB':
-                                total_bytes = original_size * 1024 * 1024 * 1024
-                            elif original_unit == 'MB':
-                                total_bytes = original_size * 1024 * 1024
-                            elif original_unit == 'KB':
-                                total_bytes = original_size * 1024
-                            else:
-                                total_bytes = original_size
-                            
-                            # Only show progress every 2 seconds to avoid spam
-                            if current_time - last_progress_time >= 2.0:
-                                print(f"\n[PROGRESS] File: {filename}")
-                                print(f"           Size: {original_size:.2f} {original_unit} → {compressed_size:.2f} {compressed_unit} (compressed)")
-                                print(f"           Deduplicated: {deduplicated_size:.2f} {deduplicated_unit}")
-                                print(f"           Files processed: {file_count}")
-                                print(f"           Elapsed: {format_duration(elapsed)}")
-                                last_progress_time = current_time
-                                
-                        except (ValueError, IndexError):
-                            # If parsing fails, show the raw line
-                            if 'Processing' in line or any(x in line for x in ['.qcow2', '.img']):
-                                print(f"\n[PROGRESS] Processing: {line}")
-                
-                # Show file counts and stats
-                elif 'files:' in line.lower() or 'directories:' in line.lower():
-                    print(f"\n[STATS] {line}")
-                
-                # Show ETA information
-                elif 'ETA:' in line:
-                    print(f"[PROGRESS] {line}")
-                
-                # Show regular output for other important messages
-                elif any(msg in line for msg in ['Archive', 'Time', 'Duration', 'compressed']):
-                    print(f"[INFO] {line}")
+            # Read from stdout
+            stdout_line = process.stdout.readline()
+            if stdout_line:
+                line = stdout_line.strip()
+                if line:  # Only print non-empty lines
+                    print(f"[BORG] {line}")
+            
+            # Read from stderr (where Borg progress goes)
+            stderr_line = process.stderr.readline()
+            if stderr_line:
+                line = stderr_line.strip()
+                if line:  # Only print non-empty lines
+                    # Parse Borg's progress output for better formatting
+                    current_time = time.time()
+                    elapsed = current_time - backup_start_time
+                    
+                    # Show progress lines with better formatting
+                    if any(x in line for x in ['GB', 'MB', 'KB', 'B O']):
+                        # Only show progress every 2 seconds to avoid spam
+                        if current_time - last_progress_time >= 2.0:
+                            print(f"[PROGRESS] {line} | Elapsed: {format_duration(elapsed)}")
+                            last_progress_time = current_time
+                    elif 'files:' in line.lower() or 'directories:' in line.lower():
+                        print(f"[STATS] {line}")
+                    elif 'ETA:' in line or 'Time:' in line or 'Duration:' in line:
+                        print(f"[PROGRESS] {line}")
+                    else:
+                        print(f"[BORG] {line}")
         
         rc = process.poll()
         if check and rc != 0:
