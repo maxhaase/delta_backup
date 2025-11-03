@@ -324,14 +324,22 @@ Only in `/etc/delta-backup.conf`.
 You get your <LABEL> of which backup you want to browse, by listing the backups on you have, like this command, the column in the left is the <LABEL>:
 
 root@sun:/# BORG_PASSCOMMAND='cat /home/max/.config/borg/vm-backup.pass' borg list /STORE/BACKUP/vm-backup 
+
 `SUN-XSOL-2025-09-08_17-06            Mon, 2025-09-08 17:07:11 [03bbf11dced4174c6d0c583ddd19ae68fd0977f27a64c173c800c746d9ccf7fc]`
+
 `SUN-XSOL-2025-10-07_02-41            Tue, 2025-10-07 03:41:14 [3a5f88054d534dc30b230789f5d1dabfa984bb16efdda70997b8774a8e65c27e]`
+
 `SUN-XSOL-2025-10-10_22-26            Fri, 2025-10-10 23:26:50 [f6ba43873f6aa9fbbf1e6a1ee0ccf114a5157228a63b19e28f519828f3b37b5a]`
+
 `SUN-XSOL-2025-10-11_02-45            Sat, 2025-10-11 03:45:02 [049915e76b3dcb45e48be9387156d8ebbe166b974c2d2da134931806b077e9c0]`
-`SUN-XSOL-2025-10-11_22-33            Sat, 2025-10-11 23:34:00 [b54e3536ddd7a7b8928675e0a76fc53c4817137cf3a2b55600bc1e4addf6a5f0]`
+
+`SUN-XSOL-2025-10-11_22-33            Sat, 2025-10-11 23:34:00 [b54e3536ddd7a7b8928675e0a76fc53c4817137cf3a2b55600bc1e4addf6a5f0]
+`
 `SUN-XSOL-2025-10-17_15-02            Fri, 2025-10-17 16:03:00 [c47c6c60ac48d3facf175004f477a9b77bf337c4c098a7c361bd056424642733]`
 
+
 * So, to mount label SUN-XSOL-2025-10-17_15-02, you would:
+* 
 `sudo BORG_PASSCOMMAND='cat /home/max/.config/borg/host-backup.pass' borg mount /STORE/BACKUP/host-backup::SUN-XSOL-2025-10-17_15-02 /mnt/host-backup`
 
 ** To browse easily with a GUI file manager, I recommend the Midnight Commander, you install it like `apt install mc` or `yum install mc`, depending on your system**
