@@ -315,7 +315,7 @@ newgrp libvirt
 **Where do I configure paths, repos, and exclusions?**  
 Only in `/etc/delta-backup.conf`.
 
-## MOUNT A BACKUP AND BROWSE THROUGH THE FILES WITHOUT HARMING ANYTHING :-) 
+## MOUNT A VM AND BROWSE THROUGH IT WITHOUT HARMING ANYTHING :-) 
 * First, create a place to mount it, for example:
   ` sudo mkdir -p /mnt/host-backup`
 * Then mount it!
