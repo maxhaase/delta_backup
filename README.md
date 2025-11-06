@@ -66,40 +66,44 @@ sudo ./delta_backup_install.sh
 
 Edit `/etc/delta-backup.conf`. Every line is documented. Example:
 
-~~~ini
-[delta]
-backup_root = /srv/backup
-host_repo   = /srv/backup/host-backup
-vm_repo     = /srv/backup/vm-backup
+This is where the repo will be located, this is your backup, preferebly not the same disk! 
+backup_root = /STORE/BACKUP/             # Root directory that contains all repositories (must exist; absolute path)
+host_repo   = /STORE/BACKUP/host-backup  # Absolute path to the host repository, the repo itself, jusl like in git (must exist)
+host_passfile = /home/max/.config/borg/host-backup.pass # File containing passphrase for the HOST repo (read via `cat`), keep it secure!!!
 
-host_passfile = /home/delta/.config/delta/host.pass
-vm_passfile   = /home/delta/.config/delta/vm.pass
+Your swapfile is likely different on your system, also, you might have more stuff you want ignored from the backup, edit this next line for that, Notice the /STORE/BACKUP/* itself is ignored, otherwise you'd end up with a circular rerference and crash your system w4en the disk fills up!
+host_excludes = /proc,/sys,/dev,/run,/tmp,/var/tmp,/lost+found,/mnt,/media,/SWAPFILE,/var/cache,/var/lib/apt/lists,/var/cache/apt/archives,*/.cache,/STORE/BACKUP/*
 
-host_excludes = /proc,/sys,/dev,/run,/tmp,/var/tmp,/lost+found,/mnt,/media,/SWAPFILE,/var/lib/libvirt/images,/var/cache,/var/lib/apt/lists,/var/cache/apt/archives,*/.cache
-extra_paths =
-extra_prefix = extra
+THIS IS WHAT WILL GO INTO YOUR BACKUP! (comma-separated, no brackets or quotes)
+include_paths = /bin,/boot,/etc,/home,/lib,/lib64,/opt,/root,/sbin,/srv,/usr,/var
 
-enable_prune = false
-prune_keep_daily = 7
-prune_keep_weekly = 4
-prune_keep_monthly = 6
+extra_paths =                           # Comma/newline separated list of extra paths to back up as separate archives (can be empty)
+extra_prefix = extra                    # Prefix used for extra path archives (combined as {hostname}-{extra_prefix}-{index})
 
-enable_compact = true
-vm_shutdown_timeout = 300
-vm_startup_grace = 5
+enable_prune = false                    # Whether to prune old archives after backups (true/false/yes/no/on/off/1/0)
+prune_keep_daily = 15                   # Retention: keep this many daily archives when pruning
+prune_keep_weekly = 6                   # Retention: keep this many weekly archives when pruning
+prune_keep_monthly = 6                  # Retention: keep this many monthly archives when pruning
 
-lock_file = /var/lock/delta-backup.lock
-lock_wait = 120
-require_mountpoint = false
+enable_compact = true                   # Whether to compact repositories to reclaim space after run (true/false/etc.)
 
-engine_bin = borg
-engine_compression = zstd,6
-engine_filter = AME
-engine_one_file_system = true
-engine_files_cache = ctime,size,inode
+The following VM-related settings are kept but will be ignored in the script
+vm_shutdown_timeout = 600               # Seconds to wait for a VM to shut down gracefully before forcing
+vm_startup_grace = 5                    # Seconds to wait after starting a VM before proceeding
 
-delta_user = delta
-delta_group = backup
+lock_file = /var/lock/max-backup.lock   # Lock file used to prevent concurrent runs (must be writable by root)
+lock_wait = 120                         # Seconds the engine should wait to acquire repository locks
+require_mountpoint = false              # If true, backup_root must be an actual mountpoint (useful for removable disks)
+
+engine_bin = borg                       # Underlying engine command used to perform backups (e.g., borg)
+engine_compression = zstd,6             # Engine compression setting (engine-native syntax)
+engine_filter = AME                     # Engine listing filter (engine-native value, e.g., AME)
+engine_one_file_system = true           # If true, restrict archive to a single filesystem (engine flag)
+engine_files_cache = ctime,size,inode   # Engine files cache mode (improves change detection)
+
+max_user = max                          # System user that will own config, initialize repos, and run optional UI
+max_group = backup                      # System group that should have read/write access to backup locations
+
 ~~~
 
 ---
