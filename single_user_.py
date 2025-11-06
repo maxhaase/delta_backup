@@ -3,9 +3,10 @@
 
 """
 delta-client-backup.py — curated user/workstation backup using centralized config
-#################################################################################
-Author: Max Haase – maxhaase@gmail.com
-#################################################################################
+######################################################################################
+# Author: Max Haase
+# maxhaase@gmail.com
+######################################################################################
 Purpose:
   - Back up a selected set of important directories for a single machine/user.
   - All customization is centralized in: /etc/delta_backup.conf  (NOTE THE UNDERSCORE)
