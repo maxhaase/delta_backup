@@ -45,6 +45,7 @@ def run(cmd, check=True, capture_output=False, env=None, show_progress=False):
     
     if show_progress:
         # For Borg commands, let it output directly to terminal for real-time progress
+        # This is crucial for Borg's progress display to work properly
         process = subprocess.Popen(cmd, env=env)
         rc = process.wait()
         
@@ -92,83 +93,123 @@ def load_config():
         'extra_prefix': clean_config_value(delta.get('extra_prefix', 'extra')),
         'lock_file': clean_config_value(delta.get('lock_file', '/var/lock/max-backup.lock')),
         'lock_wait': clean_config_value(delta.get('lock_wait', '120')),
-        'vm_shutdown_timeout': int(clean_config_value(delta.get('vm_shutdown_timeout', '600'))),
-        'vm_startup_grace': int(clean_config_value(delta.get('vm_startup_grace', '5'))),
         'engine_compression': clean_config_value(delta.get('engine_compression', 'zstd,6')),
         'engine_filter': clean_config_value(delta.get('engine_filter', 'AME')),
         'engine_files_cache': clean_config_value(delta.get('engine_files_cache', 'ctime,size,inode')),
-        'engine_one_file_system': True
+        'engine_one_file_system': True,
+        'pause_vms': clean_config_value(delta.get('pause_vms', 'true')).lower() in ('true', 'yes', 'on', '1'),
+        'vm_pause_timeout': int(clean_config_value(delta.get('vm_pause_timeout', '30'))),
     }
 
 CONFIG = load_config()
 HOST_REPO = CONFIG['host_repo']
 HOST_PASSFILE = CONFIG['host_passfile']
 LOCK_FILE = CONFIG['lock_file']
-INCLUDE_PATHS = CONFIG['include_paths']
+INCLUDE_PATHS = CONFIG['include_paths']  # Now loaded from config
 
 # === VM MANAGEMENT ===
 def get_running_vms():
-    """Get list of running VMs"""
+    """Get list of currently running VMs"""
     try:
-        result = subprocess.run(['virsh', 'list', '--state-running', '--name'], 
-                              capture_output=True, text=True, check=True)
+        result = subprocess.run(
+            ["virsh", "list", "--state-running", "--name"], 
+            capture_output=True, text=True, check=True
+        )
         vms = [vm.strip() for vm in result.stdout.splitlines() if vm.strip()]
         return vms
     except subprocess.CalledProcessError as e:
         print(f"[WARN] Could not get running VMs: {e}")
         return []
+    except FileNotFoundError:
+        print("[INFO] libvirt not available, skipping VM management")
+        return []
 
-def shutdown_vm(vm_name, timeout=600):
-    """Shutdown VM gracefully"""
-    print(f"[VM] Shutting down VM: {vm_name}")
+def get_vm_state(vm_name):
+    """Get current state of a VM"""
     try:
-        subprocess.run(['virsh', 'shutdown', vm_name], check=True)
+        result = subprocess.run(
+            ["virsh", "domstate", vm_name], 
+            capture_output=True, text=True, check=True
+        )
+        return result.stdout.strip().lower()
+    except subprocess.CalledProcessError:
+        return "unknown"
+
+def pause_vm(vm_name, timeout=30):
+    """Pause a running VM"""
+    print(f"[INFO] Pausing VM: {vm_name}")
+    try:
+        subprocess.run(["virsh", "suspend", vm_name], check=True, timeout=timeout)
         
-        # Wait for shutdown to complete
-        start_time = time.time()
-        while time.time() - start_time < timeout:
-            result = subprocess.run(['virsh', 'domstate', vm_name], 
-                                  capture_output=True, text=True, check=True)
-            if 'shut off' in result.stdout.lower():
-                print(f"[VM] VM {vm_name} shut down successfully")
+        # Wait for VM to actually be paused
+        for i in range(timeout):
+            state = get_vm_state(vm_name)
+            if state == "paused":
+                print(f"[INFO] VM {vm_name} paused successfully")
                 return True
-            time.sleep(5)
+            time.sleep(1)
         
-        # If graceful shutdown failed, force destroy
-        print(f"[VM] Graceful shutdown failed for {vm_name}, forcing destroy")
-        subprocess.run(['virsh', 'destroy', vm_name], check=True)
-        return True
+        print(f"[WARN] VM {vm_name} did not reach paused state within {timeout} seconds")
+        return False
         
+    except subprocess.TimeoutExpired:
+        print(f"[ERROR] Timeout pausing VM {vm_name}")
+        return False
     except subprocess.CalledProcessError as e:
-        print(f"[ERROR] Failed to shutdown VM {vm_name}: {e}")
+        print(f"[ERROR] Failed to pause VM {vm_name}: {e}")
         return False
 
-def start_vm(vm_name):
-    """Start VM"""
-    print(f"[VM] Starting VM: {vm_name}")
+def resume_vm(vm_name, timeout=30):
+    """Resume a paused VM"""
+    print(f"[INFO] Resuming VM: {vm_name}")
     try:
-        subprocess.run(['virsh', 'start', vm_name], check=True)
-        time.sleep(CONFIG['vm_startup_grace'])  # Wait for VM to stabilize
-        print(f"[VM] VM {vm_name} started successfully")
-        return True
+        subprocess.run(["virsh", "resume", vm_name], check=True, timeout=timeout)
+        
+        # Wait for VM to actually be running
+        for i in range(timeout):
+            state = get_vm_state(vm_name)
+            if state == "running":
+                print(f"[INFO] VM {vm_name} resumed successfully")
+                return True
+            time.sleep(1)
+        
+        print(f"[WARN] VM {vm_name} did not reach running state within {timeout} seconds")
+        return False
+        
+    except subprocess.TimeoutExpired:
+        print(f"[ERROR] Timeout resuming VM {vm_name}")
+        return False
     except subprocess.CalledProcessError as e:
-        print(f"[ERROR] Failed to start VM {vm_name}: {e}")
+        print(f"[ERROR] Failed to resume VM {vm_name}: {e}")
         return False
 
-def create_vm_snapshot(vm_name):
-    """Create a snapshot of VM disks (simplified approach)"""
-    print(f"[VM] Creating snapshot for VM: {vm_name}")
-    # For production use, you'd want to use proper libvirt snapshots
-    # or qcow2 internal snapshots. This is a simplified version.
-    try:
-        # Get VM disk paths
-        result = subprocess.run(['virsh', 'domblklist', vm_name, '--details'], 
-                              capture_output=True, text=True, check=True)
-        print(f"[VM] Disk info for {vm_name}:\n{result.stdout}")
-        return True
-    except subprocess.CalledProcessError as e:
-        print(f"[WARN] Could not create snapshot for {vm_name}: {e}")
-        return False
+def manage_vms_for_backup(pause=True):
+    """Pause or resume all running VMs for backup consistency"""
+    if not CONFIG['pause_vms']:
+        print("[INFO] VM pausing disabled in config")
+        return []
+    
+    running_vms = get_running_vms()
+    if not running_vms:
+        print("[INFO] No running VMs found")
+        return []
+    
+    managed_vms = []
+    
+    if pause:
+        print(f"[INFO] Pausing {len(running_vms)} running VMs for backup consistency")
+        for vm in running_vms:
+            if pause_vm(vm, CONFIG['vm_pause_timeout']):
+                managed_vms.append(vm)
+            else:
+                print(f"[WARN] Will backup VM {vm} in running state (pause failed)")
+    else:
+        print(f"[INFO] Resuming {len(running_vms)} paused VMs")
+        for vm in running_vms:
+            if not resume_vm(vm, CONFIG['vm_pause_timeout']):
+                print(f"[ERROR] Failed to resume VM {vm}")
+    
+    return managed_vms
 
 # === LOCK HANDLING ===
 def acquire_lock():
@@ -191,11 +232,12 @@ def borg_env(passfile):
     env = os.environ.copy()
     env["BORG_PASSCOMMAND"] = f"cat {passfile}"
     env["BORG_FILES_CACHE"] = CONFIG['engine_files_cache']
-    env["BORG_LOCK_WAIT"] = CONFIG['lock_wait']
+    env["BORG_LOCK_WAIT"] = CONFIG['lock_wait']  # Use configured lock wait time
     return env
 
 def borg_create(repo, passfile, sources, excludes=None, prefix=None, comment=None):
     hostname = socket.gethostname()
+    # Fixed: Use timezone-aware datetime to avoid deprecation warning
     archive = f"{(prefix or hostname)}-{datetime.now(timezone.utc).strftime('%Y-%m-%d_%H-%M')}"
     archive_loc = f"{repo}::{archive}"
     cmd = [
@@ -224,12 +266,14 @@ def check_and_fix_borg_lock():
     lock_path = os.path.join(HOST_REPO, "lock")
     lock_exempt_path = os.path.join(HOST_REPO, "lock.exclusive")
     
+    # Check if lock files exist
     has_lock = os.path.exists(lock_path) or os.path.exists(lock_exempt_path)
     
     if has_lock:
         print(f"[WARN] Borg lock file(s) detected in {HOST_REPO}")
         print("[INFO] Checking if lock is stale...")
         
+        # Try to list repositories to see if we can access it
         env = borg_env(HOST_PASSFILE)
         test_cmd = ["borg", "list", "--short", HOST_REPO]
         result = subprocess.run(test_cmd, env=env, capture_output=True, text=True)
@@ -237,6 +281,7 @@ def check_and_fix_borg_lock():
         if result.returncode != 0 and "lock" in result.stderr:
             print("[WARN] Repository appears to be locked. Breaking stale lock...")
             
+            # Break the lock using borg break-lock
             break_cmd = ["borg", "break-lock", HOST_REPO]
             break_result = subprocess.run(break_cmd, env=env, capture_output=True, text=True)
             
@@ -244,7 +289,7 @@ def check_and_fix_borg_lock():
                 print("[INFO] Successfully broke stale Borg lock")
             else:
                 print(f"[ERROR] Failed to break lock: {break_result.stderr}")
-                print("[INFO] Manual intervention required: borg break-lock /STORE/BACKUP/host-backup")
+                print("[INFO] You may need to manually break the lock with: borg break-lock /STORE/BACKUP/host-backup")
         else:
             print("[INFO] Repository is accessible, lock appears to be valid")
     else:
@@ -255,40 +300,27 @@ def main():
     if os.geteuid() != 0:
         die("Must be run as root")
     
+    # Check if Borg repository exists and is accessible
     if not os.path.exists(HOST_REPO):
         die(f"Borg repository not found: {HOST_REPO}")
     
+    # Check for stale Borg locks before starting
     check_and_fix_borg_lock()
+    
     acquire_lock()
     start_time = time.time()
     hostname = socket.gethostname()
-
-    # Track VMs that were running so we can restart them
-    originally_running_vms = []
+    
+    paused_vms = []
 
     try:
+        # Phase 1: Pause VMs for consistent backup
         print("\n=== VM MANAGEMENT ===")
-        # Get list of running VMs
-        running_vms = get_running_vms()
-        originally_running_vms = running_vms.copy()
+        paused_vms = manage_vms_for_backup(pause=True)
         
-        if running_vms:
-            print(f"[VM] Found {len(running_vms)} running VMs: {', '.join(running_vms)}")
-            
-            # Shutdown VMs for consistent backup
-            successful_shutdowns = []
-            for vm in running_vms:
-                if shutdown_vm(vm, CONFIG['vm_shutdown_timeout']):
-                    successful_shutdowns.append(vm)
-                else:
-                    print(f"[WARN] Will backup VM {vm} in running state (may be inconsistent)")
-            
-            print(f"[VM] Successfully shut down {len(successful_shutdowns)} VMs")
-        else:
-            print("[VM] No running VMs found")
-
-        print("\n=== HOST BACKUP (with consistent VM images) ===")
-        print("[INFO] VMs are properly shut down for consistent backup")
+        # Phase 2: Perform backups
+        print("\n=== HOST BACKUP (including VM images) ===")
+        print("[INFO] VM disk images in /var/lib/libvirt/images are now included in host backup")
         
         rc = borg_create(HOST_REPO, HOST_PASSFILE, INCLUDE_PATHS, excludes=CONFIG['host_excludes'], prefix=hostname)
         if rc != 0:
@@ -304,12 +336,10 @@ def main():
                 print(f"[SKIP] Extra path not found: {path}")
 
     finally:
-        print("\n=== VM RECOVERY ===")
-        # Restart VMs that were originally running
-        if originally_running_vms:
-            print(f"[VM] Restarting {len(originally_running_vms)} VMs...")
-            for vm in originally_running_vms:
-                start_vm(vm)
+        # Phase 3: Always resume VMs, even if backup fails
+        print("\n=== VM MANAGEMENT ===")
+        if paused_vms:
+            manage_vms_for_backup(pause=False)
         
         release_lock()
         dur = int(time.time() - start_time)
