@@ -275,7 +275,7 @@ def check_and_fix_borg_lock():
         
         # Try to list repositories to see if we can access it
         env = borg_env(HOST_PASSFILE)
-        test_cmd = ["borg", "list", "--short", HOST_REPO]
+        test_cmd = ["borg", "info", HOST_REPO]
         result = subprocess.run(test_cmd, env=env, capture_output=True, text=True)
         
         if result.returncode != 0 and "lock" in result.stderr:
