@@ -9,6 +9,7 @@ import os, subprocess, shlex, time, socket, sys, shutil, configparser
 from datetime import datetime, timezone
 import xml.etree.ElementTree as ET
 
+# Make sure the following path is correct and that you have already configured that file!
 CONFIG_FILE = "/etc/delta-backup.conf"
 
 # === HELPERS ===
